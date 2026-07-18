@@ -36,10 +36,66 @@ import { DataSource } from 'typeorm';
 import csv from 'csv-parser';
 import { Readable } from 'stream';
 import * as XLSX from 'xlsx';
+import * as sql from 'mssql';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class UploadService {
-  constructor(private dataSource: DataSource) {} //datasource injectée ici (crée dans app.module.ts)
+  constructor(
+    private dataSource: DataSource,
+    private configService: ConfigService, // ← nouveau, pour lire le .env
+  ) {}
+
+  private getBaseConfig(): sql.config {
+    return {
+      server: this.configService.get('DB_HOST') ?? 'localhost',
+      port: parseInt(this.configService.get('DB_PORT') ?? '1433', 10),
+      user: this.configService.get('DB_USERNAME') ?? 'sa',
+      password: this.configService.get('DB_PASSWORD'),
+      options: { encrypt: false, trustServerCertificate: true },
+    };
+  }
+
+  // Connexion au serveur SANS base précise (pour lister/créer des bases)
+  private async getMasterPool(): Promise<sql.ConnectionPool> {
+    return sql.connect({ ...this.getBaseConfig(), database: 'master' });
+  }
+
+  async listDatabases(): Promise<string[]> {
+    const pool = await this.getMasterPool();
+    try {
+      const result = await pool.request().query(`
+        SELECT name FROM sys.databases
+        WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')
+        ORDER BY name
+      `);
+      return result.recordset.map((r) => r.name);
+    } finally {
+      await pool.close();
+    }
+  }
+
+  async ensureDatabaseExists(database: string): Promise<{ created: boolean }> {
+    // Sécurité basique : n'accepte que des noms de base "propres" (lettres, chiffres, underscore)
+    if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+      throw new BadRequestException('Nom de base de données invalide (lettres, chiffres, underscore uniquement)');
+    }
+
+    const pool = await this.getMasterPool();
+    try {
+      const check = await pool.request().query(`
+        SELECT name FROM sys.databases WHERE name = '${database}'
+      `);
+      if (check.recordset.length > 0) {
+        return { created: false }; // existe déjà
+      }
+      await pool.request().query(`CREATE DATABASE [${database}]`);
+      return { created: true };
+    } finally {
+      await pool.close();
+    }
+  }
+
 
   async processFile(file: Express.Multer.File) {
     const extension = file.originalname.split('.').pop()?.toLowerCase();

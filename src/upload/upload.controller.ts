@@ -40,7 +40,7 @@
 //   }
 // }
 
-import { Controller, Post, UseInterceptors, UploadedFiles, BadRequestException } from '@nestjs/common';
+import { Controller, Post, Body, UseInterceptors, UploadedFiles, BadRequestException, Get } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { UploadService } from './upload.service';
 
@@ -49,6 +49,20 @@ const ALLOWED_EXTENSIONS = ['csv', 'xlsx', 'xls', 'txt'];
 @Controller('upload')
 export class UploadController {
   constructor(private readonly uploadService: UploadService) {}
+
+    @Get('databases')
+    async listDatabases() {
+    return this.uploadService.listDatabases();
+    }
+
+    @Post('databases')
+    async createDatabase(@Body('name') name: string) {
+    if (!name) {
+        throw new BadRequestException('Le nom de la base est requis');
+    }
+    return this.uploadService.ensureDatabaseExists(name);
+    }
+
 
   @Post()
   @UseInterceptors(FilesInterceptor('files', 10))
