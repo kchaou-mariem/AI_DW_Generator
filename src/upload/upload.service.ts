@@ -17,6 +17,8 @@ export interface ColumnMetadata {
   min?: string | number;
   max?: string | number;
   detectedPattern?: string;
+  avgLength?: number;
+  maxLength?: number;
 }
 
 export interface CrossTableRelation {
@@ -148,14 +150,12 @@ export class UploadService {
   }
 
   // ---- Excel ----
-  // cellDates + dateNF : force les cellules de type date à sortir en texte "AAAA-MM-JJ"
-  // au lieu du numéro de série Excel brut (ex: 40572)
- private parseExcel(buffer: Buffer): any[] {
-  const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
-  const firstSheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[firstSheetName];
-  return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true }); // raw: true garde les Date et number natifs
-}
+  private parseExcel(buffer: Buffer): any[] {
+    const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+    const firstSheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[firstSheetName];
+    return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true });
+  }
 
   // ---- TXT ----
   private parseTxt(buffer: Buffer): Promise<any[]> {
@@ -177,40 +177,38 @@ export class UploadService {
   }
 
   private detectTypes(columns: string[], rows: any[]): Record<string, string> {
-  const types: Record<string, string> = {};
-  for (const col of columns) {
-    const values = rows.map((r) => r[col]).filter((v) => v !== '' && v != null);
-    if (values.length === 0) {
-      types[col] = 'VARCHAR(255)';
-      continue;
-    }
+    const types: Record<string, string> = {};
+    for (const col of columns) {
+      const values = rows.map((r) => r[col]).filter((v) => v !== '' && v != null);
+      if (values.length === 0) {
+        types[col] = 'VARCHAR(255)';
+        continue;
+      }
 
-    // Cas Excel : vrais objets Date natifs (fiable, pas de regex nécessaire)
-    if (values.every((v) => v instanceof Date)) {
-      types[col] = 'DATE';
-      continue;
-    }
-    // Cas Excel : vrais nombres natifs
-    if (values.every((v) => typeof v === 'number')) {
-      types[col] = Number.isInteger(values[0]) && values.every((v) => Number.isInteger(v)) ? 'INT' : 'DECIMAL(18,4)';
-      continue;
-    }
+      if (values.every((v) => v instanceof Date)) {
+        types[col] = 'DATE';
+        continue;
+      }
+      if (values.every((v) => typeof v === 'number')) {
+        types[col] =
+          Number.isInteger(values[0]) && values.every((v) => Number.isInteger(v)) ? 'INT' : 'DECIMAL(18,4)';
+        continue;
+      }
 
-    // Cas CSV/TXT : tout arrive en texte, on garde la détection par regex
-    const strValues = values.map((v) => String(v));
-    if (strValues.every((v) => /^-?\d+$/.test(v))) {
-      types[col] = 'INT';
-    } else if (strValues.every((v) => /^-?\d+(\.\d+)?$/.test(v))) {
-      types[col] = 'DECIMAL(18,4)';
-    } else if (strValues.every((v) => /^\d{4}-\d{2}-\d{2}/.test(v) || /^\d{2}\/\d{2}\/\d{4}/.test(v))) {
-      types[col] = 'DATE';
-    } else {
-      const maxLen = Math.max(...strValues.map((v) => v.length), 50);
-      types[col] = `VARCHAR(${Math.min(maxLen + 20, 4000)})`;
+      const strValues = values.map((v) => String(v));
+      if (strValues.every((v) => /^-?\d+$/.test(v))) {
+        types[col] = 'INT';
+      } else if (strValues.every((v) => /^-?\d+(\.\d+)?$/.test(v))) {
+        types[col] = 'DECIMAL(18,4)';
+      } else if (strValues.every((v) => /^\d{4}-\d{2}-\d{2}/.test(v) || /^\d{2}\/\d{2}\/\d{4}/.test(v))) {
+        types[col] = 'DATE';
+      } else {
+        const maxLen = Math.max(...strValues.map((v) => v.length), 50);
+        types[col] = `VARCHAR(${Math.min(maxLen + 20, 4000)})`;
+      }
     }
+    return types;
   }
-  return types;
-}
 
   private async createTable(pool: sql.ConnectionPool, tableName: string, types: Record<string, string>) {
     const columnsDef = Object.entries(types)
@@ -223,27 +221,26 @@ export class UploadService {
     await pool.request().query(query);
   }
 
- private async bulkInsert(pool: sql.ConnectionPool, tableName: string, columns: string[], rows: any[]) {
-  const colList = columns.map((c) => `[${c}]`).join(', ');
-  const batchSize = 500;
-  for (let i = 0; i < rows.length; i += batchSize) {
-    const batch = rows.slice(i, i + batchSize);
-    const values = batch
-      .map((row) => {
-        const rowValues = columns.map((c) => {
-          let val = row[c] ?? '';
-          if (val instanceof Date) {
-            val = val.toISOString().split('T')[0]; // "2011-01-29"
-          }
-          return `'${String(val).replace(/'/g, "''")}'`;
-        });
-        return `(${rowValues.join(', ')})`;
-      })
-      .join(', ');
-    await pool.request().query(`INSERT INTO ${tableName} (${colList}) VALUES ${values}`);
+  private async bulkInsert(pool: sql.ConnectionPool, tableName: string, columns: string[], rows: any[]) {
+    const colList = columns.map((c) => `[${c}]`).join(', ');
+    const batchSize = 500;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      const values = batch
+        .map((row) => {
+          const rowValues = columns.map((c) => {
+            let val = row[c] ?? '';
+            if (val instanceof Date) {
+              val = val.toISOString().split('T')[0];
+            }
+            return `'${String(val).replace(/'/g, "''")}'`;
+          });
+          return `(${rowValues.join(', ')})`;
+        })
+        .join(', ');
+      await pool.request().query(`INSERT INTO ${tableName} (${colList}) VALUES ${values}`);
+    }
   }
-}
-  
 
   // ---- Métadonnées à la demande, lues depuis SQL Server ----
   async buildMetadataForDatabase(database: string): Promise<ColumnMetadata[][]> {
@@ -300,13 +297,13 @@ export class UploadService {
         FROM [${tableName}]
         WHERE [${colName}] IS NOT NULL
       `);
-      const rawSamples = samplesResult.recordset.map((r) => String(r.val));
+      const rawSamples = samplesResult.recordset.map((r) => this.formatSampleValue(r.val));
 
       let isSensitive = isSensitiveByUniqueness;
       let detectedPattern: string | undefined;
 
       if (sqlType.toLowerCase().includes('varchar')) {
-        detectedPattern = this.detectPattern(rawSamples);
+        detectedPattern = this.detectPattern(rawSamples.map(String));
         if (detectedPattern === 'email' || detectedPattern === 'phone') {
           isSensitive = true;
         }
@@ -318,11 +315,26 @@ export class UploadService {
         dataType: sqlType,
         cardinality: stats.cardinality,
         nullPercentage: total > 0 ? Math.round((stats.nullCount / total) * 100) : 0,
-        sampleValues: isSensitive ? [] : rawSamples,
+        sampleValues: isSensitive ? [] : rawSamples.map(String),
         isLikelyKey: total > 0 && stats.cardinality === total - stats.nullCount,
         isSensitive,
       };
       if (detectedPattern) meta.detectedPattern = detectedPattern;
+
+      // Longueur moyenne/max des chaînes — utile pour distinguer un code court d'un texte libre
+      if (sqlType.toLowerCase().includes('varchar')) {
+        const [lengthStats] = (await pool.request().query(`
+          SELECT
+            AVG(CAST(LEN([${colName}]) AS FLOAT)) as avgLen,
+            MAX(LEN([${colName}])) as maxLen
+          FROM [${tableName}]
+          WHERE [${colName}] IS NOT NULL
+        `)).recordset;
+        if (lengthStats.avgLen !== null) {
+          meta.avgLength = Math.round(lengthStats.avgLen * 10) / 10;
+          meta.maxLength = lengthStats.maxLen;
+        }
+      }
 
       if (['int', 'decimal', 'numeric', 'float', 'date', 'datetime'].includes(sqlType.toLowerCase())) {
         const [minMax] = (await pool.request().query(`
@@ -331,8 +343,8 @@ export class UploadService {
           WHERE [${colName}] IS NOT NULL
         `)).recordset;
         if (minMax.minVal !== null) {
-          meta.min = minMax.minVal;
-          meta.max = minMax.maxVal;
+          meta.min = this.formatSampleValue(minMax.minVal);
+          meta.max = this.formatSampleValue(minMax.maxVal);
         }
       }
 
@@ -340,6 +352,13 @@ export class UploadService {
     }
 
     return metadata;
+  }
+
+  private formatSampleValue(val: any): string | number {
+    if (val instanceof Date) {
+      return val.toISOString().split('T')[0];
+    }
+    return val;
   }
 
   private isSensitiveColumn(dataType: string, cardinality: number, totalRows: number): boolean {
@@ -379,8 +398,6 @@ export class UploadService {
 
         const nameMatch = this.normalizeColumnName(colA.columnName) === this.normalizeColumnName(colB.columnName);
 
-        // sampleOverlap désactivé dès qu'une des deux colonnes est numérique
-        // (les petits nombres se recoupent par pur hasard, peu importe si c'est une clé ou non)
         const eitherIsNumeric = this.isNumericType(colA.dataType) || this.isNumericType(colB.dataType);
         const sampleOverlap = !eitherIsNumeric && colA.sampleValues.some((v) => colB.sampleValues.includes(v));
 
