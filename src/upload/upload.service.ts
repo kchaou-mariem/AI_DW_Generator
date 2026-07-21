@@ -34,14 +34,16 @@ export class UploadService {
   constructor(private configService: ConfigService) {}
 
   private getBaseConfig(): sql.config {
-    return {
-      server: this.configService.get('DB_HOST') ?? 'localhost',
-      port: parseInt(this.configService.get('DB_PORT') ?? '1433', 10),
-      user: this.configService.get('DB_USERNAME') ?? 'sa',
-      password: this.configService.get('DB_PASSWORD'),
-      options: { encrypt: false, trustServerCertificate: true },
-    };
-  }
+  return {
+    server: this.configService.get('DB_HOST') ?? 'localhost',
+    port: parseInt(this.configService.get('DB_PORT') ?? '1433', 10),
+    user: this.configService.get('DB_USERNAME') ?? 'sa',
+    password: this.configService.get('DB_PASSWORD'),
+    options: { encrypt: false, trustServerCertificate: true },
+    requestTimeout: 60000, // ← 60 secondes au lieu du défaut (15s)
+    connectionTimeout: 30000, // ← 30 secondes pour établir la connexion
+  };
+}
 
   private async getMasterPool(): Promise<sql.ConnectionPool> {
     return sql.connect({ ...this.getBaseConfig(), database: 'master' });

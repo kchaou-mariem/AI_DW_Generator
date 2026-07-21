@@ -7,5 +7,7 @@ import { UploadService } from './upload.service';
   imports: [ConfigModule],//on n a plus besoin de TypeOrmModule car on utilise le service UploadService pour se connecter à la base de données
   controllers: [UploadController],
   providers: [UploadService],
+    exports: [UploadService], // ← ajouté
+
 })
 export class UploadModule {}

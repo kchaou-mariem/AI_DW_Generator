@@ -14,6 +14,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { UploadModule } from './upload/upload.module';
 import { config } from 'rxjs/internal/config';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { AiModule } from './ai/ai.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
       }),
     }),
     UploadModule,
+    AiModule,
   ],
 })
 export class AppModule {}
