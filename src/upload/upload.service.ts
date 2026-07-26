@@ -421,4 +421,59 @@ export class UploadService {
   private normalizeColumnName(name: string): string {
     return name.toLowerCase().replace(/[_\s-]/g, '');
   }
+
+  async saveSchemaValidation(database: string, schema: unknown): Promise<{ savedAt: string }> {
+  if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+    throw new BadRequestException('Nom de base de données invalide');
+  }
+
+  const pool = await this.getPool(database);
+  try {
+    await pool.request().query(`
+      IF OBJECT_ID('dw_schema_validation', 'U') IS NULL
+      CREATE TABLE dw_schema_validation (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        schema_json NVARCHAR(MAX) NOT NULL,
+        created_at DATETIME DEFAULT GETDATE()
+      );
+    `);
+
+    const jsonString = JSON.stringify(schema).replace(/'/g, "''");
+    const result = await pool
+      .request()
+      .query(`INSERT INTO dw_schema_validation (schema_json) OUTPUT INSERTED.created_at VALUES ('${jsonString}')`);
+
+    return { savedAt: result.recordset[0].created_at };
+  } finally {
+    await pool.close();
+  }
+}
+
+async getLatestSchemaValidation(database: string): Promise<{ schema: unknown; createdAt: string } | null> {
+  if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+    throw new BadRequestException('Nom de base de données invalide');
+  }
+
+  const pool = await this.getPool(database);
+  try {
+    const tableExists = await pool.request().query(`
+      SELECT OBJECT_ID('dw_schema_validation', 'U') as id
+    `);
+    if (!tableExists.recordset[0].id) return null;
+
+    const result = await pool.request().query(`
+      SELECT TOP 1 schema_json, created_at
+      FROM dw_schema_validation
+      ORDER BY created_at DESC
+    `);
+    if (result.recordset.length === 0) return null;
+
+    return {
+      schema: JSON.parse(result.recordset[0].schema_json),
+      createdAt: result.recordset[0].created_at,
+    };
+  } finally {
+    await pool.close();
+  }
+}
 }

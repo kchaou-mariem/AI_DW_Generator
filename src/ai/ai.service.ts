@@ -284,4 +284,6 @@ RÈGLES STRICTES à respecter absolument :
 
     return { dimensions: cleanDimensions, facts: cleanFacts, confirmedRelations, additionalRelations, warnings };
   }
+
+  
 }
