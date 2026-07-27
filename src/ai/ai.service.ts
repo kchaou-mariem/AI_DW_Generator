@@ -8,8 +8,15 @@ export interface AiSchemaProposal {
   additionalRelations: CrossTableRelation[];
   generatedDimensions: any[];
   factColumnTransformations: any[];
+  subDimensions: SubDimension[];
   rawResponse: string;
   warnings: string[];
+}
+export interface SubDimension {
+  name: string;
+  parentDimension: string;
+  sourceColumn: string;
+  generatedPrimaryKey: string;
 }
 
 @Injectable()
@@ -54,11 +61,11 @@ export class AiService {
   }
 
   private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[], hasDateColumn: boolean): string {
-    const dateRule = hasDateColumn
-      ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps" dans "dimensions" — cette table est calculée automatiquement plus tard, elle n'a pas besoin d'exister dans les métadonnées fournies.`
-      : '';
+  const dateRule = hasDateColumn
+    ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps" dans "dimensions" — cette table est calculée automatiquement plus tard, elle n'a pas besoin d'exister dans les métadonnées fournies. Ne propose PAS de relation vers DimTemps toi-même, elle sera générée automatiquement.`
+    : '';
 
-    return `Tu es un architecte BI expert en modélisation de data warehouse (schéma en étoile).
+  return `Tu es un architecte BI expert en modélisation de data warehouse.
 
 Métadonnées des tables de staging :
 ${JSON.stringify(metadata)}
@@ -67,14 +74,18 @@ Relations déjà détectées par un pré-filtre :
 ${JSON.stringify(relations)}
 
 RÈGLES STRICTES à respecter absolument :
-1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts". Ne jamais oublier une table, ne jamais en dupliquer une. Utilise EXCLUSIVEMENT les noms de tables tels qu'ils apparaissent dans les métadonnées (ex: "staging_Employees"), jamais un nom renommé.
+1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts". Ne jamais oublier une table, ne jamais en dupliquer une. Utilise EXCLUSIVEMENT les noms de tables tels qu'ils apparaissent dans les métadonnées, jamais un nom renommé.
 2. N'invente JAMAIS de nom de table ou de colonne qui n'existe pas dans les métadonnées fournies, sauf la dimension temporelle décrite ci-dessous.${dateRule}
-3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées (respecte la casse), sauf pour "DimTemps" qui n'a pas de colonnes définies dans le staging.
-4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES (les noms de tables), jamais des objets avec des sous-propriétés.
-5. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
+3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées (respecte la casse), sauf pour "DimTemps".
+4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES, jamais des objets.
+5. INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
+6. Si une dimension a une colonne catégorielle avec très peu de valeurs distinctes par rapport au nombre total de lignes (ex: une colonne avec seulement 3-10 valeurs distinctes sur des centaines de lignes), tu PEUX proposer de l'extraire en sous-dimension séparée, pour éviter la répétition. Format pour ça :
+{"subDimensions": [{"name": "DimNomChoisi", "parentDimension": "nom_table_existante", "sourceColumn": "nom_colonne_existante_dans_le_parent", "generatedPrimaryKey": "NomCleGeneree"}]}
+N'invente une sous-dimension QUE si la colonne source existe réellement dans les métadonnées du parent fourni.
+7. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
 
-{"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}]}`;
-  }
+{"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"subDimensions":[]}`;
+}
 
   private async callOllama(prompt: string): Promise<string> {
     let response: Response;
@@ -107,20 +118,22 @@ RÈGLES STRICTES à respecter absolument :
   }
 
   private parseAiResponse(rawResponse: string): {
-    dimensions: unknown[];
-    facts: unknown[];
-    confirmedRelations: any[];
-    additionalRelations: any[];
-  } {
-    const cleaned = rawResponse.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(cleaned);
-    return {
-      dimensions: parsed.dimensions ?? [],
-      facts: parsed.facts ?? [],
-      confirmedRelations: parsed.confirmedRelations ?? [],
-      additionalRelations: parsed.additionalRelations ?? [],
-    };
-  }
+  dimensions: unknown[];
+  facts: unknown[];
+  confirmedRelations: any[];
+  additionalRelations: any[];
+  subDimensions: unknown[];
+} {
+  const cleaned = rawResponse.replace(/```json|```/g, '').trim();
+  const parsed = JSON.parse(cleaned);
+  return {
+    dimensions: parsed.dimensions ?? [],
+    facts: parsed.facts ?? [],
+    confirmedRelations: parsed.confirmedRelations ?? [],
+    additionalRelations: parsed.additionalRelations ?? [],
+    subDimensions: parsed.subDimensions ?? [],
+  };
+}
 
   private isLegitimateDerivedDimension(tableName: unknown, hasDateColumn: boolean): boolean {
     if (typeof tableName !== 'string') return false;
@@ -211,6 +224,47 @@ RÈGLES STRICTES à respecter absolument :
       reason: 'dimension_temporelle_generee_automatiquement',
     },
   };
+}
+private validateSubDimensions(
+  rawSubDimensions: unknown,
+  validColumnsByTable: Map<string, Set<string>>,
+  cleanDimensions: string[],
+  warnings: string[],
+): SubDimension[] {
+  if (!Array.isArray(rawSubDimensions)) return [];
+
+  const usedNames = new Set<string>();
+
+  return rawSubDimensions.filter((sd: any): sd is SubDimension => {
+    if (!sd || !sd.name || !sd.parentDimension || !sd.sourceColumn || !sd.generatedPrimaryKey) {
+      warnings.push(`Sous-dimension ignorée (champs manquants): ${JSON.stringify(sd)}`);
+      return false;
+    }
+
+    // Le parent doit être une vraie dimension déjà classée (pas une table de faits, pas une table inventée)
+    if (!cleanDimensions.includes(sd.parentDimension)) {
+      warnings.push(`Sous-dimension ignorée (parent "${sd.parentDimension}" n'est pas une dimension valide): ${sd.name}`);
+      return false;
+    }
+
+    // La colonne source doit réellement exister dans le parent
+    const parentCols = validColumnsByTable.get(sd.parentDimension);
+    if (!parentCols || !parentCols.has(sd.sourceColumn)) {
+      warnings.push(
+        `Sous-dimension ignorée (colonne "${sd.sourceColumn}" inexistante dans "${sd.parentDimension}"): ${sd.name}`,
+      );
+      return false;
+    }
+
+    // Le nom de la sous-dimension ne doit pas entrer en collision avec une table existante ou une autre sous-dimension
+    if (cleanDimensions.includes(sd.name) || usedNames.has(sd.name)) {
+      warnings.push(`Sous-dimension ignorée (nom "${sd.name}" en conflit avec une table existante)`);
+      return false;
+    }
+
+    usedNames.add(sd.name);
+    return true;
+  });
 }
  private validateAndClean(
     parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
@@ -353,6 +407,14 @@ RÈGLES STRICTES à respecter absolument :
       );
     }
 
+   // --- Validation des sous-dimensions proposées par l'IA ---
+    const subDimensions = this.validateSubDimensions(
+      (parsed as any).subDimensions,
+      validColumnsByTable,
+      cleanDimensions,
+      warnings,
+    );
+
     return {
       dimensions: cleanDimensions,
       facts: cleanFacts,
@@ -360,8 +422,10 @@ RÈGLES STRICTES à respecter absolument :
       additionalRelations,
       generatedDimensions,
       factColumnTransformations,
+      subDimensions,
       warnings,
     };
+  
   }
 
 
