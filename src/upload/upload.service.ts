@@ -476,4 +476,137 @@ async getLatestSchemaValidation(database: string): Promise<{ schema: unknown; cr
     await pool.close();
   }
 }
+async initChatSession(database: string, initialSchema: unknown): Promise<{ sessionId: number }> {
+  const pool = await this.getPool(database);
+  try {
+    await pool.request().query(`
+      IF OBJECT_ID('dw_schema_chat_history', 'U') IS NULL
+      CREATE TABLE dw_schema_chat_history (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        session_id INT NOT NULL,
+        step_number INT NOT NULL,
+        schema_json NVARCHAR(MAX) NOT NULL,
+        user_message NVARCHAR(MAX) NULL,
+        ai_explanation NVARCHAR(MAX) NULL,
+        created_at DATETIME DEFAULT GETDATE()
+      );
+    `);
+
+    const sessionResult = await pool.request().query(`
+      SELECT ISNULL(MAX(session_id), 0) + 1 as newSessionId FROM dw_schema_chat_history
+    `);
+    const sessionId = sessionResult.recordset[0].newSessionId;
+
+    const jsonString = JSON.stringify(initialSchema).replace(/'/g, "''");
+    await pool.request().query(`
+      INSERT INTO dw_schema_chat_history (session_id, step_number, schema_json, user_message, ai_explanation)
+      VALUES (${sessionId}, 0, '${jsonString}', NULL, 'Proposition initiale de l''IA')
+    `);
+
+    return { sessionId };
+  } finally {
+    await pool.close();
+  }
+}
+async initChatSessionFromExisting(database: string, existingSchema: unknown): Promise<{ sessionId: number }> {
+  if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+    throw new BadRequestException('Nom de base de données invalide');
+  }
+
+  const pool = await this.getPool(database);
+  try {
+    await pool.request().query(`
+      IF OBJECT_ID('dw_schema_chat_history', 'U') IS NULL
+      CREATE TABLE dw_schema_chat_history (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        session_id INT NOT NULL,
+        step_number INT NOT NULL,
+        schema_json NVARCHAR(MAX) NOT NULL,
+        user_message NVARCHAR(MAX) NULL,
+        ai_explanation NVARCHAR(MAX) NULL,
+        created_at DATETIME DEFAULT GETDATE()
+      );
+    `);
+
+    const sessionResult = await pool.request().query(`
+      SELECT ISNULL(MAX(session_id), 0) + 1 as newSessionId FROM dw_schema_chat_history
+    `);
+    const sessionId = sessionResult.recordset[0].newSessionId;
+
+    const jsonString = JSON.stringify(existingSchema).replace(/'/g, "''");
+    await pool.request().query(`
+      INSERT INTO dw_schema_chat_history (session_id, step_number, schema_json, user_message, ai_explanation)
+      VALUES (${sessionId}, 0, '${jsonString}', NULL, 'Reprise d''un schéma existant')
+    `);
+
+    return { sessionId };
+  } finally {
+    await pool.close();
+  }
+}
+
+async addChatStep(
+  database: string,
+  sessionId: number,
+  newSchema: unknown,
+  userMessage: string,
+  aiExplanation: string,
+): Promise<{ stepNumber: number }> {
+  const pool = await this.getPool(database);
+  try {
+    const stepResult = await pool.request().query(`
+      SELECT ISNULL(MAX(step_number), -1) + 1 as newStep
+      FROM dw_schema_chat_history WHERE session_id = ${sessionId}
+    `);
+    const stepNumber = stepResult.recordset[0].newStep;
+
+    const jsonString = JSON.stringify(newSchema).replace(/'/g, "''");
+    const messageEscaped = userMessage.replace(/'/g, "''");
+    const explanationEscaped = aiExplanation.replace(/'/g, "''");
+
+    await pool.request().query(`
+      INSERT INTO dw_schema_chat_history (session_id, step_number, schema_json, user_message, ai_explanation)
+      VALUES (${sessionId}, ${stepNumber}, '${jsonString}', '${messageEscaped}', '${explanationEscaped}')
+    `);
+
+    return { stepNumber };
+  } finally {
+    await pool.close();
+  }
+}
+
+async getChatHistory(database: string, sessionId: number): Promise<any[]> {
+  const pool = await this.getPool(database);
+  try {
+    const result = await pool.request().query(`
+      SELECT step_number, schema_json, user_message, ai_explanation, created_at
+      FROM dw_schema_chat_history
+      WHERE session_id = ${sessionId}
+      ORDER BY step_number ASC
+    `);
+    return result.recordset.map((r) => ({
+      stepNumber: r.step_number,
+      schema: JSON.parse(r.schema_json),
+      userMessage: r.user_message,
+      aiExplanation: r.ai_explanation,
+      createdAt: r.created_at,
+    }));
+  } finally {
+    await pool.close();
+  }
+}
+
+async getSchemaAtStep(database: string, sessionId: number, stepNumber: number): Promise<unknown | null> {
+  const pool = await this.getPool(database);
+  try {
+    const result = await pool.request().query(`
+      SELECT schema_json FROM dw_schema_chat_history
+      WHERE session_id = ${sessionId} AND step_number = ${stepNumber}
+    `);
+    if (result.recordset.length === 0) return null;
+    return JSON.parse(result.recordset[0].schema_json);
+  } finally {
+    await pool.close();
+  }
+}
 }

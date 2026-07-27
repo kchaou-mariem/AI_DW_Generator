@@ -181,109 +181,226 @@ RÈGLES STRICTES à respecter absolument :
   }
 
   private validateAndClean(
-    parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
-    validTableNames: Set<string>,
-    validColumnsByTable: Map<string, Set<string>>,
-    metadata: ColumnMetadata[][],
-  ): Omit<AiSchemaProposal, 'rawResponse'> {
-    const warnings: string[] = [];
-    const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
+  parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
+  validTableNames: Set<string>,
+  validColumnsByTable: Map<string, Set<string>>,
+  metadata: ColumnMetadata[][],
+): Omit<AiSchemaProposal, 'rawResponse'> {
+  const warnings: string[] = [];
+  const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
 
-    const isKnownOrDerived = (t: string, bucket: string): boolean => {
-      if (validTableNames.has(t)) return true;
-      if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
-        warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
-        return true;
-      }
-      warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
+  const isKnownOrDerived = (t: string, bucket: string): boolean => {
+    if (validTableNames.has(t)) return true;
+    if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
+      warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
+      return true;
+    }
+    warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
+    return false;
+  };
+
+  const normalizedDimensions = parsed.dimensions
+    .map((t) => this.normalizeTableEntry(t, validTableNames))
+    .filter((t): t is string => t !== null);
+  const normalizedFacts = parsed.facts
+    .map((t) => this.normalizeTableEntry(t, validTableNames))
+    .filter((t): t is string => t !== null);
+
+  const dimensions = normalizedDimensions.filter((t) => isKnownOrDerived(t, 'dimensions'));
+  const facts = normalizedFacts.filter((t) => isKnownOrDerived(t, 'facts'));
+
+  const seen = new Set<string>();
+  const cleanFacts = facts.filter((t) => {
+    if (seen.has(t)) return false;
+    seen.add(t);
+    return true;
+  });
+  const cleanDimensions = dimensions.filter((t) => {
+    if (seen.has(t)) {
+      warnings.push(`Table ${t} classée à la fois en fact et dimension — gardée en fait uniquement`);
       return false;
-    };
-
-    const normalizedDimensions = parsed.dimensions
-      .map((t) => this.normalizeTableEntry(t, validTableNames))
-      .filter((t): t is string => t !== null);
-    const normalizedFacts = parsed.facts
-      .map((t) => this.normalizeTableEntry(t, validTableNames))
-      .filter((t): t is string => t !== null);
-
-    const dimensions = normalizedDimensions.filter((t) => isKnownOrDerived(t, 'dimensions'));
-    const facts = normalizedFacts.filter((t) => isKnownOrDerived(t, 'facts'));
-
-    // Doublons entre dimensions et facts : priorité au fait
-    const seen = new Set<string>();
-    const cleanFacts = facts.filter((t) => {
-      if (seen.has(t)) return false;
-      seen.add(t);
-      return true;
-    });
-    const cleanDimensions = dimensions.filter((t) => {
-      if (seen.has(t)) {
-        warnings.push(`Table ${t} classée à la fois en fact et dimension — gardée en fact uniquement`);
-        return false;
-      }
-      seen.add(t);
-      return true;
-    });
-
-    // Tables de staging jamais classées : ajoutées en dimension par défaut
-    for (const tableName of validTableNames) {
-      if (!seen.has(tableName)) {
-        warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
-        cleanDimensions.push(tableName);
-        seen.add(tableName);
-      }
     }
+    seen.add(t);
+    return true;
+  });
 
-    // Garde-fou 1 : au moins une table de faits
-    if (cleanFacts.length === 0) {
-      const fallbackFact = this.detectLikelyFactTable(metadata);
-      if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
-        warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
-        cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
-        cleanFacts.push(fallbackFact);
-      }
+  for (const tableName of validTableNames) {
+    if (!seen.has(tableName)) {
+      warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
+      cleanDimensions.push(tableName);
+      seen.add(tableName);
     }
-
-    // Garde-fou 2 : DimTemps automatique si date dans le fait
-    const factTableMeta = metadata.find((table) => cleanFacts.includes(table[0]?.sourceTable));
-    const hasDateInFact = factTableMeta?.some((col) => col.dataType.toLowerCase().includes('date'));
-    if (hasDateInFact && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
-      warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans la table de faits)');
-      cleanDimensions.push('DimTemps');
-    }
-
-    // Validation des relations : DimTemps acceptée sans vérification de colonnes
-    const isValidRelation = (r: any): boolean => {
-      if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
-        warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
-        return false;
-      }
-
-      const isDerivedA = this.isLegitimateDerivedDimension(r.tableA, hasDateColumn);
-      const isDerivedB = this.isLegitimateDerivedDimension(r.tableB, hasDateColumn);
-
-      if (!isDerivedA) {
-        const colsA = validColumnsByTable.get(r.tableA);
-        if (!colsA || !colsA.has(r.columnA)) {
-          warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
-          return false;
-        }
-      }
-      if (!isDerivedB) {
-        const colsB = validColumnsByTable.get(r.tableB);
-        if (!colsB || !colsB.has(r.columnB)) {
-          warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
-          return false;
-        }
-      }
-      return true;
-    };
-
-    const confirmedRelations = parsed.confirmedRelations.filter(isValidRelation);
-    const additionalRelations = parsed.additionalRelations.filter(isValidRelation);
-
-    return { dimensions: cleanDimensions, facts: cleanFacts, confirmedRelations, additionalRelations, warnings };
   }
 
-  
+  if (cleanFacts.length === 0) {
+    const fallbackFact = this.detectLikelyFactTable(metadata);
+    if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
+      warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
+      cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
+      cleanFacts.push(fallbackFact);
+    }
+  }
+
+  const factTableMeta = metadata.find((table) => cleanFacts.includes(table[0]?.sourceTable));
+  const hasDateInFact = factTableMeta?.some((col) => col.dataType.toLowerCase().includes('date'));
+  if (hasDateInFact && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
+    warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans la table de faits)');
+    cleanDimensions.push('DimTemps');
+  }
+
+  // --- Validation des relations, en 2 passes ---
+
+  // Passe 1 : valide structurellement (colonnes existantes) et sépare fait-dimension vs dimension-dimension
+  const structurallyValid = (r: any): boolean => {
+    if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
+      warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
+      return false;
+    }
+    const isDerivedA = this.isLegitimateDerivedDimension(r.tableA, hasDateColumn);
+    const isDerivedB = this.isLegitimateDerivedDimension(r.tableB, hasDateColumn);
+
+    if (!isDerivedA) {
+      const colsA = validColumnsByTable.get(r.tableA);
+      if (!colsA || !colsA.has(r.columnA)) {
+        warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
+        return false;
+      }
+    }
+    if (!isDerivedB) {
+      const colsB = validColumnsByTable.get(r.tableB);
+      if (!colsB || !colsB.has(r.columnB)) {
+        warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
+
+  // Détermine quelles dimensions sont déjà reliées DIRECTEMENT à un fait
+  const dimensionsLinkedToFact = new Set<string>();
+  for (const r of allRelationsRaw) {
+    if (cleanFacts.includes(r.tableA) && cleanDimensions.includes(r.tableB)) dimensionsLinkedToFact.add(r.tableB);
+    if (cleanFacts.includes(r.tableB) && cleanDimensions.includes(r.tableA)) dimensionsLinkedToFact.add(r.tableA);
+  }
+
+  // Passe 2 : applique la règle dimension-dimension
+  const isValidRelation = (r: any): boolean => {
+    const aIsFact = cleanFacts.includes(r.tableA);
+    const bIsFact = cleanFacts.includes(r.tableB);
+
+    if (aIsFact || bIsFact) return true; // relation fait-dimension : toujours autorisée si structurellement valide
+
+    // Relation dimension-dimension : interdite seulement si LES DEUX sont déjà reliées directement à un fait
+    const aLinked = dimensionsLinkedToFact.has(r.tableA);
+    const bLinked = dimensionsLinkedToFact.has(r.tableB);
+    if (aLinked && bLinked) {
+      warnings.push(
+        `Relation rejetée (${r.tableA} et ${r.tableB} sont toutes deux déjà reliées au fait — relation redondante/suspecte)`,
+      );
+      return false;
+    }
+    return true; // sous-dimension légitime (hiérarchie)
+  };
+
+  const confirmedRelations = parsed.confirmedRelations.filter(structurallyValid).filter(isValidRelation);
+  const additionalRelations = parsed.additionalRelations.filter(structurallyValid).filter(isValidRelation);
+
+  return { dimensions: cleanDimensions, facts: cleanFacts, confirmedRelations, additionalRelations, warnings };
+}
+private buildChatPrompt(currentSchema: any, userMessage: string): string {
+    return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
+
+Schéma actuel :
+${JSON.stringify({ dimensions: currentSchema.dimensions, facts: currentSchema.facts, confirmedRelations: currentSchema.confirmedRelations })}
+
+Message de l'utilisateur : "${userMessage}"
+
+Réponds à sa question ou sa demande de façon naturelle et utile, en français. Si sa demande implique une modification claire du schéma (déplacer une table, ajouter/retirer une relation), applique-la. Sinon, réponds simplement sans modifier le schéma.
+
+Réponds STRICTEMENT en JSON avec ce format :
+{"reply":"ta réponse conversationnelle à l'utilisateur, peut être une explication, une réponse à une question, ou une confirmation de modification","dimensions":["..."],"facts":["..."],"confirmedRelations":[...]}
+
+Les champs "dimensions", "facts", "confirmedRelations" doivent TOUJOURS être présents et refléter le schéma actuel — inchangé si aucune modification n'était demandée, modifié sinon.`;
+  }
+
+  private computeDiffExplanation(oldSchema: any, newSchema: any): string {
+    const changes: string[] = [];
+
+    const oldDimensions = oldSchema.dimensions ?? [];
+    const oldFacts = oldSchema.facts ?? [];
+    const newDimensions = newSchema.dimensions ?? [];
+    const newFacts = newSchema.facts ?? [];
+
+    const movedToFacts = newFacts.filter((t: string) => oldDimensions.includes(t));
+    const movedToDimensions = newDimensions.filter((t: string) => oldFacts.includes(t));
+
+    movedToFacts.forEach((t: string) => changes.push(`${t} déplacée de dimension vers fait`));
+    movedToDimensions.forEach((t: string) => changes.push(`${t} déplacée de fait vers dimension`));
+
+    const addedDimensions = newDimensions.filter(
+      (t: string) => !oldDimensions.includes(t) && !oldFacts.includes(t),
+    );
+    const addedFacts = newFacts.filter((t: string) => !oldDimensions.includes(t) && !oldFacts.includes(t));
+    addedDimensions.forEach((t: string) => changes.push(`${t} ajoutée en dimension`));
+    addedFacts.forEach((t: string) => changes.push(`${t} ajoutée en fait`));
+
+    const oldRelations = oldSchema.confirmedRelations ?? [];
+    const newRelations = newSchema.confirmedRelations ?? [];
+
+    const relationKey = (r: any) => `${r.tableA}.${r.columnA}-${r.tableB}.${r.columnB}`;
+    const oldKeys = new Set(oldRelations.map(relationKey));
+    const newKeys = new Set(newRelations.map(relationKey));
+
+    const added = newRelations.filter((r: any) => !oldKeys.has(relationKey(r)));
+    const removed = oldRelations.filter((r: any) => !newKeys.has(relationKey(r)));
+
+    if (added.length > 0) changes.push(`${added.length} relation(s) ajoutée(s)`);
+    if (removed.length > 0) changes.push(`${removed.length} relation(s) supprimée(s)`);
+
+    return changes.length > 0 ? changes.join(' ; ') : 'Aucun changement détecté dans le schéma';
+  }
+async applyChatModification(
+  database: string,
+  currentSchema: any,
+  userMessage: string,
+): Promise<{ updatedSchema: AiSchemaProposal; explanation: string }> {
+  const metadata = await this.uploadService.buildMetadataForDatabase(database);
+  const validTableNames = new Set(metadata.map((cols) => cols[0]?.sourceTable).filter(Boolean));
+  const validColumnsByTable = new Map<string, Set<string>>();
+  for (const cols of metadata) {
+    if (cols.length === 0) continue;
+    validColumnsByTable.set(cols[0].sourceTable, new Set(cols.map((c) => c.columnName)));
+  }
+
+  const prompt = this.buildChatPrompt(currentSchema, userMessage);
+  const rawResponse = await this.callOllama(prompt);
+  const cleaned = rawResponse.replace(/```json|```/g, '').trim();
+  const parsed = JSON.parse(cleaned);
+
+  const validated = this.validateAndClean(
+    {
+      dimensions: parsed.dimensions ?? currentSchema.dimensions,
+      facts: parsed.facts ?? currentSchema.facts,
+      confirmedRelations: parsed.confirmedRelations ?? currentSchema.confirmedRelations,
+      additionalRelations: [],
+    },
+    validTableNames,
+    validColumnsByTable,
+    metadata,
+  );
+
+  const diffText = this.computeDiffExplanation(currentSchema, validated);
+  const hasRealChange = diffText !== 'Aucun changement détecté dans le schéma';
+
+  const finalReply = hasRealChange
+    ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
+    : parsed.reply ?? 'Je n\'ai pas de réponse claire à ta demande, peux-tu reformuler ?';
+
+  return {
+    updatedSchema: { ...validated, rawResponse },
+    explanation: finalReply,
+  };
+}
 }
