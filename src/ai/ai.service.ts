@@ -6,6 +6,8 @@ export interface AiSchemaProposal {
   facts: string[];
   confirmedRelations: CrossTableRelation[];
   additionalRelations: CrossTableRelation[];
+  generatedDimensions: any[];
+  factColumnTransformations: any[];
   rawResponse: string;
   warnings: string[];
 }
@@ -180,135 +182,189 @@ RÈGLES STRICTES à respecter absolument :
     return ['int', 'decimal', 'numeric', 'float'].some((t) => dataType.toLowerCase().includes(t));
   }
 
-  private validateAndClean(
-  parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
-  validTableNames: Set<string>,
-  validColumnsByTable: Map<string, Set<string>>,
-  metadata: ColumnMetadata[][],
-): Omit<AiSchemaProposal, 'rawResponse'> {
-  const warnings: string[] = [];
-  const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
-
-  const isKnownOrDerived = (t: string, bucket: string): boolean => {
-    if (validTableNames.has(t)) return true;
-    if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
-      warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
-      return true;
-    }
-    warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
-    return false;
+  private buildDimTempsStructure(
+  factTableName: string,
+  dateColumnName: string,
+): { generatedDimension: any; factTransformation: any; relation: any } {
+  return {
+    generatedDimension: {
+      name: 'DimTemps',
+      columns: [
+        { name: 'DateKey', type: 'INT', isPrimaryKey: true },
+        { name: 'Date', type: 'DATE', isPrimaryKey: false },
+      ],
+      sourceColumn: dateColumnName,
+    },
+    factTransformation: {
+      factTable: factTableName,
+      originalColumn: dateColumnName,
+      newColumn: `${dateColumnName}Key`,
+      newColumnType: 'INT',
+      referencesTable: 'DimTemps',
+      referencesColumn: 'DateKey',
+    },
+    relation: {
+      tableA: factTableName,
+      columnA: `${dateColumnName}Key`,
+      tableB: 'DimTemps',
+      columnB: 'DateKey',
+      reason: 'dimension_temporelle_generee_automatiquement',
+    },
   };
+}
+ private validateAndClean(
+    parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
+    validTableNames: Set<string>,
+    validColumnsByTable: Map<string, Set<string>>,
+    metadata: ColumnMetadata[][],
+  ): Omit<AiSchemaProposal, 'rawResponse'> {
+    const warnings: string[] = [];
+    const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
 
-  const normalizedDimensions = parsed.dimensions
-    .map((t) => this.normalizeTableEntry(t, validTableNames))
-    .filter((t): t is string => t !== null);
-  const normalizedFacts = parsed.facts
-    .map((t) => this.normalizeTableEntry(t, validTableNames))
-    .filter((t): t is string => t !== null);
-
-  const dimensions = normalizedDimensions.filter((t) => isKnownOrDerived(t, 'dimensions'));
-  const facts = normalizedFacts.filter((t) => isKnownOrDerived(t, 'facts'));
-
-  const seen = new Set<string>();
-  const cleanFacts = facts.filter((t) => {
-    if (seen.has(t)) return false;
-    seen.add(t);
-    return true;
-  });
-  const cleanDimensions = dimensions.filter((t) => {
-    if (seen.has(t)) {
-      warnings.push(`Table ${t} classée à la fois en fact et dimension — gardée en fait uniquement`);
+    const isKnownOrDerived = (t: string, bucket: string): boolean => {
+      if (validTableNames.has(t)) return true;
+      if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
+        warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
+        return true;
+      }
+      warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
       return false;
+    };
+
+    const normalizedDimensions = parsed.dimensions
+      .map((t) => this.normalizeTableEntry(t, validTableNames))
+      .filter((t): t is string => t !== null);
+    const normalizedFacts = parsed.facts
+      .map((t) => this.normalizeTableEntry(t, validTableNames))
+      .filter((t): t is string => t !== null);
+
+    const dimensions = normalizedDimensions.filter((t) => isKnownOrDerived(t, 'dimensions'));
+    const facts = normalizedFacts.filter((t) => isKnownOrDerived(t, 'facts'));
+
+    const seen = new Set<string>();
+    const cleanFacts = facts.filter((t) => {
+      if (seen.has(t)) return false;
+      seen.add(t);
+      return true;
+    });
+    const cleanDimensions = dimensions.filter((t) => {
+      if (seen.has(t)) {
+        warnings.push(`Table ${t} classée à la fois en fait et dimension — gardée en fait uniquement`);
+        return false;
+      }
+      seen.add(t);
+      return true;
+    });
+
+    for (const tableName of validTableNames) {
+      if (!seen.has(tableName)) {
+        warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
+        cleanDimensions.push(tableName);
+        seen.add(tableName);
+      }
     }
-    seen.add(t);
-    return true;
-  });
 
-  for (const tableName of validTableNames) {
-    if (!seen.has(tableName)) {
-      warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
-      cleanDimensions.push(tableName);
-      seen.add(tableName);
+    if (cleanFacts.length === 0) {
+      const fallbackFact = this.detectLikelyFactTable(metadata);
+      if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
+        warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
+        cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
+        cleanFacts.push(fallbackFact);
+      }
     }
-  }
 
-  if (cleanFacts.length === 0) {
-    const fallbackFact = this.detectLikelyFactTable(metadata);
-    if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
-      warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
-      cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
-      cleanFacts.push(fallbackFact);
-    }
-  }
-
-  const factTableMeta = metadata.find((table) => cleanFacts.includes(table[0]?.sourceTable));
-  const hasDateInFact = factTableMeta?.some((col) => col.dataType.toLowerCase().includes('date'));
-  if (hasDateInFact && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
-    warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans la table de faits)');
-    cleanDimensions.push('DimTemps');
-  }
-
-  // --- Validation des relations, en 2 passes ---
-
-  // Passe 1 : valide structurellement (colonnes existantes) et sépare fait-dimension vs dimension-dimension
-  const structurallyValid = (r: any): boolean => {
-    if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
-      warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
-      return false;
-    }
-    const isDerivedA = this.isLegitimateDerivedDimension(r.tableA, hasDateColumn);
-    const isDerivedB = this.isLegitimateDerivedDimension(r.tableB, hasDateColumn);
-
-    if (!isDerivedA) {
+    // --- Validation structurelle des relations proposées par l'IA ---
+    // Note : toute relation impliquant DimTemps proposée par l'IA est ignorée ici,
+    // car DimTemps est gérée intégralement par code juste après (colonnes + relation générées automatiquement)
+    const structurallyValid = (r: any): boolean => {
+      if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
+        warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
+        return false;
+      }
+      if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
+        warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
+        return false;
+      }
       const colsA = validColumnsByTable.get(r.tableA);
       if (!colsA || !colsA.has(r.columnA)) {
         warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
         return false;
       }
-    }
-    if (!isDerivedB) {
       const colsB = validColumnsByTable.get(r.tableB);
       if (!colsB || !colsB.has(r.columnB)) {
         warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
         return false;
       }
+      return true;
+    };
+
+    const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
+
+    const dimensionsLinkedToFact = new Set<string>();
+    for (const r of allRelationsRaw) {
+      if (cleanFacts.includes(r.tableA) && cleanDimensions.includes(r.tableB)) dimensionsLinkedToFact.add(r.tableB);
+      if (cleanFacts.includes(r.tableB) && cleanDimensions.includes(r.tableA)) dimensionsLinkedToFact.add(r.tableA);
     }
-    return true;
-  };
 
-  const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
+    const isValidRelation = (r: any): boolean => {
+      const aIsFact = cleanFacts.includes(r.tableA);
+      const bIsFact = cleanFacts.includes(r.tableB);
+      if (aIsFact || bIsFact) return true;
 
-  // Détermine quelles dimensions sont déjà reliées DIRECTEMENT à un fait
-  const dimensionsLinkedToFact = new Set<string>();
-  for (const r of allRelationsRaw) {
-    if (cleanFacts.includes(r.tableA) && cleanDimensions.includes(r.tableB)) dimensionsLinkedToFact.add(r.tableB);
-    if (cleanFacts.includes(r.tableB) && cleanDimensions.includes(r.tableA)) dimensionsLinkedToFact.add(r.tableA);
+      const aLinked = dimensionsLinkedToFact.has(r.tableA);
+      const bLinked = dimensionsLinkedToFact.has(r.tableB);
+      if (aLinked && bLinked) {
+        warnings.push(
+          `Relation rejetée (${r.tableA} et ${r.tableB} sont toutes deux déjà reliées au fait — relation redondante/suspecte)`,
+        );
+        return false;
+      }
+      return true;
+    };
+
+    const confirmedRelations = parsed.confirmedRelations.filter(structurallyValid).filter(isValidRelation);
+    const additionalRelations = parsed.additionalRelations.filter(structurallyValid).filter(isValidRelation);
+
+    // --- Génération automatique et complète de DimTemps (jamais laissée à l'IA) ---
+    const factTableMeta = metadata.find((table) => cleanFacts.includes(table[0]?.sourceTable));
+    const dateColumnInFact = factTableMeta?.find((col) => col.dataType.toLowerCase().includes('date'));
+    const hasDateInFact = Boolean(dateColumnInFact);
+
+    let generatedDimensions: any[] = [];
+    let factColumnTransformations: any[] = [];
+    const finalConfirmedRelations = [...confirmedRelations];
+
+    if (hasDateInFact && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
+      warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans la table de faits)');
+      cleanDimensions.push('DimTemps');
+    }
+
+    const dimTempsPresent = cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'));
+    if (dimTempsPresent && dateColumnInFact && cleanFacts.length > 0) {
+      const { generatedDimension, factTransformation, relation } = this.buildDimTempsStructure(
+        cleanFacts[0],
+        dateColumnInFact.columnName,
+      );
+      generatedDimensions.push(generatedDimension);
+      factColumnTransformations.push(factTransformation);
+      finalConfirmedRelations.push(relation);
+      warnings.push(
+        `Structure DimTemps générée : ${dateColumnInFact.columnName} → ${factTransformation.newColumn} (FK vers DimTemps.DateKey)`,
+      );
+    }
+
+    return {
+      dimensions: cleanDimensions,
+      facts: cleanFacts,
+      confirmedRelations: finalConfirmedRelations,
+      additionalRelations,
+      generatedDimensions,
+      factColumnTransformations,
+      warnings,
+    };
   }
 
-  // Passe 2 : applique la règle dimension-dimension
-  const isValidRelation = (r: any): boolean => {
-    const aIsFact = cleanFacts.includes(r.tableA);
-    const bIsFact = cleanFacts.includes(r.tableB);
 
-    if (aIsFact || bIsFact) return true; // relation fait-dimension : toujours autorisée si structurellement valide
-
-    // Relation dimension-dimension : interdite seulement si LES DEUX sont déjà reliées directement à un fait
-    const aLinked = dimensionsLinkedToFact.has(r.tableA);
-    const bLinked = dimensionsLinkedToFact.has(r.tableB);
-    if (aLinked && bLinked) {
-      warnings.push(
-        `Relation rejetée (${r.tableA} et ${r.tableB} sont toutes deux déjà reliées au fait — relation redondante/suspecte)`,
-      );
-      return false;
-    }
-    return true; // sous-dimension légitime (hiérarchie)
-  };
-
-  const confirmedRelations = parsed.confirmedRelations.filter(structurallyValid).filter(isValidRelation);
-  const additionalRelations = parsed.additionalRelations.filter(structurallyValid).filter(isValidRelation);
-
-  return { dimensions: cleanDimensions, facts: cleanFacts, confirmedRelations, additionalRelations, warnings };
-}
 private buildChatPrompt(currentSchema: any, userMessage: string): string {
     return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
 
