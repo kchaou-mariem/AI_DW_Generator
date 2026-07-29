@@ -62,7 +62,7 @@ export class AiService {
 
   private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[], hasDateColumn: boolean): string {
   const dateRule = hasDateColumn
-    ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps" dans "dimensions" — cette table est calculée automatiquement plus tard, elle n'a pas besoin d'exister dans les métadonnées fournies. Ne propose PAS de relation vers DimTemps toi-même, elle sera générée automatiquement.`
+    ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps"...`
     : '';
 
   return `Tu es un architecte BI expert en modélisation de data warehouse.
@@ -74,17 +74,18 @@ Relations déjà détectées par un pré-filtre :
 ${JSON.stringify(relations)}
 
 RÈGLES STRICTES à respecter absolument :
-1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts". Ne jamais oublier une table, ne jamais en dupliquer une. Utilise EXCLUSIVEMENT les noms de tables tels qu'ils apparaissent dans les métadonnées, jamais un nom renommé.
+1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts".
 2. N'invente JAMAIS de nom de table ou de colonne qui n'existe pas dans les métadonnées fournies, sauf la dimension temporelle décrite ci-dessous.${dateRule}
-3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées (respecte la casse), sauf pour "DimTemps".
-4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES, jamais des objets.
+3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées.
+4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES.
 5. INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
-6. Si une dimension a une colonne catégorielle avec très peu de valeurs distinctes par rapport au nombre total de lignes (ex: une colonne avec seulement 3-10 valeurs distinctes sur des centaines de lignes), tu PEUX proposer de l'extraire en sous-dimension séparée, pour éviter la répétition. Format pour ça :
-{"subDimensions": [{"name": "DimNomChoisi", "parentDimension": "nom_table_existante", "sourceColumn": "nom_colonne_existante_dans_le_parent", "generatedPrimaryKey": "NomCleGeneree"}]}
-N'invente une sous-dimension QUE si la colonne source existe réellement dans les métadonnées du parent fourni.
-7. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
+6. Si une dimension a une colonne catégorielle avec très peu de valeurs distinctes, tu PEUX proposer une sous-dimension. Format :
+{"subDimensions": [{"name": "...", "parentDimension": "...", "sourceColumn": "...", "generatedPrimaryKey": "..."}]}
+7. IMPORTANT — Constellation de faits : si tu identifies PLUSIEURS tables contenant chacune des mesures numériques agrégeables (ex: une table de ventes ET une table de retours produits, chacune avec ses propres montants/quantités), tu DOIS les classer TOUTES dans "facts" — ne force pas tout dans une seule table de faits. Dans ce cas, assure-toi qu'au moins une dimension (par exemple DimProduit ou DimTemps) est reliée aux DEUX tables de faits, pour que le schéma reste cohérent et exploitable en analyse croisée.
+Exemple concret : si "FactSales" et "FactReturns" existent toutes les deux avec une colonne ProductKey, les deux doivent être reliées à "DimProduct" via ProductKey — c'est ce qui permet de comparer ventes et retours par produit.
+8. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
 
-{"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"subDimensions":[]}`;
+{"dimensions":["..."],"facts":["..."],"confirmedRelations":[...],"additionalRelations":[...],"subDimensions":[]}`;
 }
 
   private async callOllama(prompt: string): Promise<string> {
@@ -324,6 +325,41 @@ private validateSubDimensions(
         warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
         cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
         cleanFacts.push(fallbackFact);
+      }
+    }
+
+    // --- Vérification de cohérence pour la constellation de faits ---
+    if (cleanFacts.length > 1) {
+      const dimensionsByFact = cleanFacts.map((fact) => {
+        const linked = new Set(
+          [...confirmedRelations, ...additionalRelations]
+            .filter((r) => r.tableA === fact || r.tableB === fact)
+            .map((r) => (r.tableA === fact ? r.tableB : r.tableA)),
+        );
+        return { fact, linked };
+      });
+
+      const allShared = dimensionsByFact.every((f, i) =>
+        dimensionsByFact.some((other, j) => i !== j && [...f.linked].some((d) => other.linked.has(d))),
+      );
+
+      if (!allShared) {
+        warnings.push('Constellation détectée mais aucune dimension partagée entre les faits — vérifier la cohérence');
+
+        // Suggestion automatique : cherche une colonne commune entre les tables de faits
+        const factMetas = cleanFacts.map((f) => metadata.find((m) => m[0]?.sourceTable === f));
+        for (let i = 0; i < factMetas.length; i++) {
+          for (let j = i + 1; j < factMetas.length; j++) {
+            const commonCols = factMetas[i]
+              ?.map((c) => c.columnName)
+              .filter((col) => factMetas[j]?.some((c2) => c2.columnName === col));
+            if (commonCols && commonCols.length > 0) {
+              warnings.push(
+                `Suggestion : ${cleanFacts[i]} et ${cleanFacts[j]} partagent la colonne ${commonCols[0]} — envisager une dimension commune`,
+              );
+            }
+          }
+        }
       }
     }
 
