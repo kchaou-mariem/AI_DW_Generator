@@ -60,10 +60,29 @@ export class AiService {
     );
   }
 
+  private findSubDimensionCandidates(metadata: ColumnMetadata[][]): string {
+  const candidates: string[] = [];
+  for (const table of metadata) {
+    for (const col of table) {
+      if (
+        col.dataType.toLowerCase().includes('varchar') &&
+        !col.isLikelyKey &&
+        col.cardinality > 1 &&
+        col.cardinality <= 15
+      ) {
+        candidates.push(`${col.sourceTable}.${col.columnName} (${col.cardinality} valeurs distinctes)`);
+      }
+    }
+  }
+  return candidates.length > 0 ? candidates.join(', ') : 'aucun candidat détecté';
+}
+
   private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[], hasDateColumn: boolean): string {
   const dateRule = hasDateColumn
-    ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps"...`
+    ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps" dans "dimensions" — cette table est calculée automatiquement plus tard, elle n'a pas besoin d'exister dans les métadonnées fournies. Ne propose PAS de relation vers DimTemps toi-même, elle sera générée automatiquement.`
     : '';
+
+  const subDimCandidates = this.findSubDimensionCandidates(metadata);
 
   return `Tu es un architecte BI expert en modélisation de data warehouse.
 
@@ -74,18 +93,19 @@ Relations déjà détectées par un pré-filtre :
 ${JSON.stringify(relations)}
 
 RÈGLES STRICTES à respecter absolument :
-1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts".
+1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts". Ne jamais oublier une table, ne jamais en dupliquer une. Utilise EXCLUSIVEMENT les noms de tables tels qu'ils apparaissent dans les métadonnées, jamais un nom renommé.
 2. N'invente JAMAIS de nom de table ou de colonne qui n'existe pas dans les métadonnées fournies, sauf la dimension temporelle décrite ci-dessous.${dateRule}
-3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées.
-4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES.
+3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées (respecte la casse), sauf pour "DimTemps".
+4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES, jamais des objets.
 5. INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
-6. Si une dimension a une colonne catégorielle avec très peu de valeurs distinctes, tu PEUX proposer une sous-dimension. Format :
-{"subDimensions": [{"name": "...", "parentDimension": "...", "sourceColumn": "...", "generatedPrimaryKey": "..."}]}
-7. IMPORTANT — Constellation de faits : si tu identifies PLUSIEURS tables contenant chacune des mesures numériques agrégeables (ex: une table de ventes ET une table de retours produits, chacune avec ses propres montants/quantités), tu DOIS les classer TOUTES dans "facts" — ne force pas tout dans une seule table de faits. Dans ce cas, assure-toi qu'au moins une dimension (par exemple DimProduit ou DimTemps) est reliée aux DEUX tables de faits, pour que le schéma reste cohérent et exploitable en analyse croisée.
-Exemple concret : si "FactSales" et "FactReturns" existent toutes les deux avec une colonne ProductKey, les deux doivent être reliées à "DimProduct" via ProductKey — c'est ce qui permet de comparer ventes et retours par produit.
+6. Colonnes candidates pour une extraction en sous-dimension (faible cardinalité déjà détectée par calcul) : ${subDimCandidates}.
+Si l'une d'elles mérite vraiment d'être extraite (catégorie métier claire, forte répétition), propose-la au format :
+{"subDimensions": [{"name": "DimNomChoisi", "parentDimension": "nom_table_du_candidat", "sourceColumn": "nom_colonne_du_candidat", "generatedPrimaryKey": "NomCleGeneree"}]}
+N'invente RIEN en dehors de cette liste de candidats. IMPORTANT : ignore complètement "DimTemps" pour cette règle — la dimension temporelle est gérée séparément et automatiquement, ne la mentionne jamais dans "subDimensions".
+7. IMPORTANT — Constellation de faits : si tu identifies PLUSIEURS tables contenant chacune des mesures numériques agrégeables, tu DOIS les classer TOUTES dans "facts". Dans ce cas, assure-toi qu'au moins une dimension est reliée aux DEUX tables de faits.
 8. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
 
-{"dimensions":["..."],"facts":["..."],"confirmedRelations":[...],"additionalRelations":[...],"subDimensions":[]}`;
+{"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"subDimensions":[]}`;
 }
 
   private async callOllama(prompt: string): Promise<string> {
@@ -196,6 +216,13 @@ Exemple concret : si "FactSales" et "FactReturns" existent toutes les deux avec 
     return ['int', 'decimal', 'numeric', 'float'].some((t) => dataType.toLowerCase().includes(t));
   }
 
+  private computeActualReason(tableA: string, columnA: string, tableB: string, columnB: string): string {
+  const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+  return normalize(columnA) === normalize(columnB)
+    ? 'nom_de_colonne_similaire'
+    : 'relation_proposee_par_ia_sans_similarite_de_nom';
+}
+
   private buildDimTempsStructure(
   factTableName: string,
   dateColumnName: string,
@@ -242,13 +269,17 @@ private validateSubDimensions(
       return false;
     }
 
-    // Le parent doit être une vraie dimension déjà classée (pas une table de faits, pas une table inventée)
+    // Nouveau : rejette explicitement toute confusion avec DimTemps
+    if (String(sd.name).toLowerCase().includes('dimtemps') || String(sd.parentDimension).toLowerCase().includes('dimtemps')) {
+      warnings.push(`Sous-dimension ignorée (confusion avec DimTemps, géré séparément): ${sd.name}`);
+      return false;
+    }
+
     if (!cleanDimensions.includes(sd.parentDimension)) {
       warnings.push(`Sous-dimension ignorée (parent "${sd.parentDimension}" n'est pas une dimension valide): ${sd.name}`);
       return false;
     }
 
-    // La colonne source doit réellement exister dans le parent
     const parentCols = validColumnsByTable.get(sd.parentDimension);
     if (!parentCols || !parentCols.has(sd.sourceColumn)) {
       warnings.push(
@@ -257,7 +288,6 @@ private validateSubDimensions(
       return false;
     }
 
-    // Le nom de la sous-dimension ne doit pas entrer en collision avec une table existante ou une autre sous-dimension
     if (cleanDimensions.includes(sd.name) || usedNames.has(sd.name)) {
       warnings.push(`Sous-dimension ignorée (nom "${sd.name}" en conflit avec une table existante)`);
       return false;
@@ -328,40 +358,7 @@ private validateSubDimensions(
       }
     }
 
-    // --- Vérification de cohérence pour la constellation de faits ---
-    if (cleanFacts.length > 1) {
-      const dimensionsByFact = cleanFacts.map((fact) => {
-        const linked = new Set(
-          [...confirmedRelations, ...additionalRelations]
-            .filter((r) => r.tableA === fact || r.tableB === fact)
-            .map((r) => (r.tableA === fact ? r.tableB : r.tableA)),
-        );
-        return { fact, linked };
-      });
-
-      const allShared = dimensionsByFact.every((f, i) =>
-        dimensionsByFact.some((other, j) => i !== j && [...f.linked].some((d) => other.linked.has(d))),
-      );
-
-      if (!allShared) {
-        warnings.push('Constellation détectée mais aucune dimension partagée entre les faits — vérifier la cohérence');
-
-        // Suggestion automatique : cherche une colonne commune entre les tables de faits
-        const factMetas = cleanFacts.map((f) => metadata.find((m) => m[0]?.sourceTable === f));
-        for (let i = 0; i < factMetas.length; i++) {
-          for (let j = i + 1; j < factMetas.length; j++) {
-            const commonCols = factMetas[i]
-              ?.map((c) => c.columnName)
-              .filter((col) => factMetas[j]?.some((c2) => c2.columnName === col));
-            if (commonCols && commonCols.length > 0) {
-              warnings.push(
-                `Suggestion : ${cleanFacts[i]} et ${cleanFacts[j]} partagent la colonne ${commonCols[0]} — envisager une dimension commune`,
-              );
-            }
-          }
-        }
-      }
-    }
+   
 
     // --- Validation structurelle des relations proposées par l'IA ---
     // Note : toute relation impliquant DimTemps proposée par l'IA est ignorée ici,
@@ -412,8 +409,50 @@ private validateSubDimensions(
       return true;
     };
 
-    const confirmedRelations = parsed.confirmedRelations.filter(structurallyValid).filter(isValidRelation);
-    const additionalRelations = parsed.additionalRelations.filter(structurallyValid).filter(isValidRelation);
+    const confirmedRelations = parsed.confirmedRelations
+    .filter(structurallyValid)
+    .filter(isValidRelation)
+    .map((r: any) => ({ ...r, reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) }));
+
+    const additionalRelations = parsed.additionalRelations
+    .filter(structurallyValid)
+    .filter(isValidRelation)
+    .map((r: any) => ({ ...r, reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) }));
+
+     // --- Vérification de cohérence pour la constellation de faits ---
+    if (cleanFacts.length > 1) {
+      const dimensionsByFact = cleanFacts.map((fact) => {
+        const linked = new Set(
+          [...confirmedRelations, ...additionalRelations]
+            .filter((r) => r.tableA === fact || r.tableB === fact)
+            .map((r) => (r.tableA === fact ? r.tableB : r.tableA)),
+        );
+        return { fact, linked };
+      });
+
+      const allShared = dimensionsByFact.every((f, i) =>
+        dimensionsByFact.some((other, j) => i !== j && [...f.linked].some((d) => other.linked.has(d))),
+      );
+
+      if (!allShared) {
+        warnings.push('Constellation détectée mais aucune dimension partagée entre les faits — vérifier la cohérence');
+
+        // Suggestion automatique : cherche une colonne commune entre les tables de faits
+        const factMetas = cleanFacts.map((f) => metadata.find((m) => m[0]?.sourceTable === f));
+        for (let i = 0; i < factMetas.length; i++) {
+          for (let j = i + 1; j < factMetas.length; j++) {
+            const commonCols = factMetas[i]
+              ?.map((c) => c.columnName)
+              .filter((col) => factMetas[j]?.some((c2) => c2.columnName === col));
+            if (commonCols && commonCols.length > 0) {
+              warnings.push(
+                `Suggestion : ${cleanFacts[i]} et ${cleanFacts[j]} partagent la colonne ${commonCols[0]} — envisager une dimension commune`,
+              );
+            }
+          }
+        }
+      }
+    }
 
     // --- Génération automatique et complète de DimTemps (jamais laissée à l'IA) ---
     const factTableMeta = metadata.find((table) => cleanFacts.includes(table[0]?.sourceTable));
