@@ -9,6 +9,7 @@ export interface AiSchemaProposal {
   generatedDimensions: any[];
   factColumnTransformations: any[];
   subDimensions: SubDimension[];
+  tableAttributes: Record<string, { name: string; type: string }[]>; // ← nouveau
   rawResponse: string;
   warnings: string[];
 }
@@ -27,6 +28,91 @@ export class AiService {
   private readonly DERIVED_DIMENSION_PREFIXES = ['dimtemps', 'dimdate', 'dimtime', 'dimcalendar'];
 
   constructor(private uploadService: UploadService) {}
+
+  private toDisplayName(tableName: string): string {
+  return tableName.replace(/^staging_/i, '');
+}
+
+private applyDisplayNames(result: Omit<AiSchemaProposal, 'rawResponse'>): Omit<AiSchemaProposal, 'rawResponse'> {
+  const rename = (t: string) => this.toDisplayName(t);
+
+  return {
+    ...result,
+    dimensions: result.dimensions.map(rename),
+    facts: result.facts.map(rename),
+    confirmedRelations: result.confirmedRelations.map((r) => ({
+      ...r,
+      tableA: rename(r.tableA),
+      tableB: rename(r.tableB),
+    })),
+    additionalRelations: result.additionalRelations.map((r) => ({
+      ...r,
+      tableA: rename(r.tableA),
+      tableB: rename(r.tableB),
+    })),
+    factColumnTransformations: result.factColumnTransformations.map((t: any) => ({
+      ...t,
+      factTable: rename(t.factTable),
+    })),
+    subDimensions: result.subDimensions.map((sd) => ({
+      ...sd,
+      parentDimension: rename(sd.parentDimension),
+    })),
+  };
+}
+
+private buildTableAttributes(
+  cleanDimensions: string[],
+  cleanFacts: string[],
+  metadata: ColumnMetadata[][],
+  generatedDimensions: any[],
+  subDimensions: SubDimension[],
+): Record<string, { name: string; type: string }[]> {
+  const attributes: Record<string, { name: string; type: string }[]> = {};
+
+  const allRealTables = [...cleanDimensions, ...cleanFacts];
+  for (const tableName of allRealTables) {
+    const tableMeta = metadata.find((m) => m[0]?.sourceTable === tableName);
+    if (tableMeta) {
+      attributes[tableName] = tableMeta.map((col) => ({ name: col.columnName, type: col.dataType }));
+    }
+  }
+
+  for (const gen of generatedDimensions) {
+    attributes[gen.name] = gen.columns.map((c: any) => ({ name: c.name, type: c.type }));
+  }
+
+  for (const sd of subDimensions) {
+    attributes[sd.name] = [
+      { name: sd.generatedPrimaryKey, type: 'INT' },
+      { name: sd.sourceColumn, type: 'VARCHAR' },
+    ];
+  }
+
+  return attributes;
+}
+
+private toInternalName(displayName: string, validTableNames: Set<string>): string {
+  if (validTableNames.has(displayName)) return displayName;
+  const withPrefix = `staging_${displayName}`;
+  if (validTableNames.has(withPrefix)) return withPrefix;
+  if (displayName.toLowerCase().includes('dimtemps')) return displayName; // DimTemps n'a pas de préfixe
+  return displayName; // sous-dimension ou cas non trouvé, laisse tel quel
+}
+
+private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
+  const restore = (t: string) => this.toInternalName(t, validTableNames);
+  return {
+    ...schema,
+    dimensions: (schema.dimensions ?? []).map(restore),
+    facts: (schema.facts ?? []).map(restore),
+    confirmedRelations: (schema.confirmedRelations ?? []).map((r: any) => ({
+      ...r,
+      tableA: restore(r.tableA),
+      tableB: restore(r.tableB),
+    })),
+  };
+}
 
   async generateSchema(database: string): Promise<AiSchemaProposal> {
     const metadata = await this.uploadService.buildMetadataForDatabase(database);
@@ -48,7 +134,8 @@ export class AiService {
         const rawResponse = await this.callOllama(prompt);
         const parsed = this.parseAiResponse(rawResponse);
         const validated = this.validateAndClean(parsed, validTableNames, validColumnsByTable, metadata);
-        return { ...validated, rawResponse };
+        const displayed = this.applyDisplayNames(validated);
+          return { ...displayed, rawResponse };
       } catch (err) {
         lastError = err.message;
         console.warn(`Tentative ${attempt}/${this.MAX_RETRIES} échouée: ${lastError}`);
@@ -490,35 +577,50 @@ private validateSubDimensions(
       warnings,
     );
 
-    return {
-      dimensions: cleanDimensions,
-      facts: cleanFacts,
-      confirmedRelations: finalConfirmedRelations,
-      additionalRelations,
-      generatedDimensions,
-      factColumnTransformations,
-      subDimensions,
-      warnings,
-    };
+   const tableAttributes = this.buildTableAttributes(
+  cleanDimensions,
+  cleanFacts,
+  metadata,
+  generatedDimensions,
+  subDimensions,
+);
+
+return {
+  dimensions: cleanDimensions,
+  facts: cleanFacts,
+  confirmedRelations: finalConfirmedRelations,
+  additionalRelations,
+  generatedDimensions,
+  factColumnTransformations,
+  subDimensions,
+  tableAttributes, // ← nouveau
+  warnings,
+};
   
   }
 
 
 private buildChatPrompt(currentSchema: any, userMessage: string): string {
-    return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
+  return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
 
 Schéma actuel :
-${JSON.stringify({ dimensions: currentSchema.dimensions, facts: currentSchema.facts, confirmedRelations: currentSchema.confirmedRelations })}
+${JSON.stringify({ dimensions: currentSchema.dimensions, facts: currentSchema.facts, confirmedRelations: currentSchema.confirmedRelations, subDimensions: currentSchema.subDimensions, tableAttributes: currentSchema.tableAttributes })}
 
 Message de l'utilisateur : "${userMessage}"
 
-Réponds à sa question ou sa demande de façon naturelle et utile, en français. Si sa demande implique une modification claire du schéma (déplacer une table, ajouter/retirer une relation), applique-la. Sinon, réponds simplement sans modifier le schéma.
+Réponds à sa question ou sa demande de façon naturelle et utile, en français. Si sa demande implique une modification claire du schéma (déplacer une table, ajouter/retirer une relation), applique-la, en respectant ces règles :
+- INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
+- Le schéma peut avoir PLUSIEURS tables de faits (constellation) si l'utilisateur le demande — dans ce cas, veille à ce qu'au moins une dimension reste reliée aux différentes tables de faits.
+- N'invente jamais de nom de table ou de colonne qui n'existe pas déjà dans le schéma actuel ou les métadonnées d'origine.
+- Ne modifie jamais "DimTemps" ni ses relations — cette dimension est gérée automatiquement, ignore toute demande à son sujet et explique-le à l'utilisateur si besoin.
+
+Sinon, réponds simplement sans modifier le schéma.
 
 Réponds STRICTEMENT en JSON avec ce format :
-{"reply":"ta réponse conversationnelle à l'utilisateur, peut être une explication, une réponse à une question, ou une confirmation de modification","dimensions":["..."],"facts":["..."],"confirmedRelations":[...]}
+{"reply":"ta réponse conversationnelle à l'utilisateur","dimensions":["..."],"facts":["..."],"confirmedRelations":[...]}
 
 Les champs "dimensions", "facts", "confirmedRelations" doivent TOUJOURS être présents et refléter le schéma actuel — inchangé si aucune modification n'était demandée, modifié sinon.`;
-  }
+}
 
   private computeDiffExplanation(oldSchema: any, newSchema: any): string {
     const changes: string[] = [];
@@ -556,6 +658,8 @@ Les champs "dimensions", "facts", "confirmedRelations" doivent TOUJOURS être pr
 
     return changes.length > 0 ? changes.join(' ; ') : 'Aucun changement détecté dans le schéma';
   }
+
+
 async applyChatModification(
   database: string,
   currentSchema: any,
@@ -569,33 +673,53 @@ async applyChatModification(
     validColumnsByTable.set(cols[0].sourceTable, new Set(cols.map((c) => c.columnName)));
   }
 
-  const prompt = this.buildChatPrompt(currentSchema, userMessage);
-  const rawResponse = await this.callOllama(prompt);
-  const cleaned = rawResponse.replace(/```json|```/g, '').trim();
-  const parsed = JSON.parse(cleaned);
+  // Remet les noms internes AVANT tout traitement, pour rester cohérent avec validColumnsByTable
+  const internalCurrentSchema = this.restoreInternalNames(currentSchema, validTableNames);
 
-  const validated = this.validateAndClean(
-    {
-      dimensions: parsed.dimensions ?? currentSchema.dimensions,
-      facts: parsed.facts ?? currentSchema.facts,
-      confirmedRelations: parsed.confirmedRelations ?? currentSchema.confirmedRelations,
-      additionalRelations: [],
-    },
-    validTableNames,
-    validColumnsByTable,
-    metadata,
+  const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage);
+
+  let lastError: string | null = null;
+  for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
+    try {
+      const rawResponse = await this.callOllama(prompt);
+      const cleaned = rawResponse.replace(/```json|```/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+
+      const validated = this.validateAndClean(
+        {
+          dimensions: parsed.dimensions ?? internalCurrentSchema.dimensions,
+          facts: parsed.facts ?? internalCurrentSchema.facts,
+          confirmedRelations: parsed.confirmedRelations ?? internalCurrentSchema.confirmedRelations,
+          additionalRelations: [],
+          subDimensions: currentSchema.subDimensions ?? [],
+        } as any,
+        validTableNames,
+        validColumnsByTable,
+        metadata,
+      );
+
+      const diffText = this.computeDiffExplanation(internalCurrentSchema, validated);
+      const hasRealChange = diffText !== 'Aucun changement détecté dans le schéma';
+
+      const finalReply = hasRealChange
+        ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
+        : parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?";
+
+      const displayed = this.applyDisplayNames(validated);
+
+      return {
+        updatedSchema: { ...displayed, rawResponse },
+        explanation: finalReply,
+      };
+    } catch (err) {
+      lastError = err.message;
+      console.warn(`Chat - tentative ${attempt}/${this.MAX_RETRIES} échouée: ${lastError}`);
+    }
+  }
+
+  throw new InternalServerErrorException(
+    `L'IA n'a pas réussi à traiter ta demande après ${this.MAX_RETRIES} tentatives. Dernière erreur: ${lastError}`,
   );
-
-  const diffText = this.computeDiffExplanation(currentSchema, validated);
-  const hasRealChange = diffText !== 'Aucun changement détecté dans le schéma';
-
-  const finalReply = hasRealChange
-    ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
-    : parsed.reply ?? 'Je n\'ai pas de réponse claire à ta demande, peux-tu reformuler ?';
-
-  return {
-    updatedSchema: { ...validated, rawResponse },
-    explanation: finalReply,
-  };
 }
+
 }
