@@ -36,6 +36,11 @@ export class AiService {
 private applyDisplayNames(result: Omit<AiSchemaProposal, 'rawResponse'>): Omit<AiSchemaProposal, 'rawResponse'> {
   const rename = (t: string) => this.toDisplayName(t);
 
+  const renamedAttributes: Record<string, { name: string; type: string }[]> = {};
+  for (const [key, value] of Object.entries(result.tableAttributes ?? {})) {
+    renamedAttributes[rename(key)] = value;
+  }
+
   return {
     ...result,
     dimensions: result.dimensions.map(rename),
@@ -58,6 +63,7 @@ private applyDisplayNames(result: Omit<AiSchemaProposal, 'rawResponse'>): Omit<A
       ...sd,
       parentDimension: rename(sd.parentDimension),
     })),
+    tableAttributes: renamedAttributes,
   };
 }
 
@@ -345,45 +351,56 @@ private validateSubDimensions(
   validColumnsByTable: Map<string, Set<string>>,
   cleanDimensions: string[],
   warnings: string[],
+  validTableNames: Set<string>,
 ): SubDimension[] {
   if (!Array.isArray(rawSubDimensions)) return [];
 
   const usedNames = new Set<string>();
 
-  return rawSubDimensions.filter((sd: any): sd is SubDimension => {
-    if (!sd || !sd.name || !sd.parentDimension || !sd.sourceColumn || !sd.generatedPrimaryKey) {
-      warnings.push(`Sous-dimension ignorée (champs manquants): ${JSON.stringify(sd)}`);
-      return false;
-    }
+  return rawSubDimensions
+    .map((sdRaw: any) => {
+      if (!sdRaw || !sdRaw.name || !sdRaw.parentDimension || !sdRaw.sourceColumn) {
+        warnings.push(`Sous-dimension ignorée (champs manquants): ${JSON.stringify(sdRaw)}`);
+        return null;
+      }
 
-    // Nouveau : rejette explicitement toute confusion avec DimTemps
-    if (String(sd.name).toLowerCase().includes('dimtemps') || String(sd.parentDimension).toLowerCase().includes('dimtemps')) {
-      warnings.push(`Sous-dimension ignorée (confusion avec DimTemps, géré séparément): ${sd.name}`);
-      return false;
-    }
+      const normalizedParent = this.normalizeTableEntry(sdRaw.parentDimension, validTableNames) ?? sdRaw.parentDimension;
 
-    if (!cleanDimensions.includes(sd.parentDimension)) {
-      warnings.push(`Sous-dimension ignorée (parent "${sd.parentDimension}" n'est pas une dimension valide): ${sd.name}`);
-      return false;
-    }
+      // Force toujours le nom de la clé générée nous-mêmes — ne jamais faire confiance
+      // au nom proposé par l'IA, qui peut entrer en collision avec sourceColumn (ex: "Region" au lieu de "RegionKey")
+      const enforcedKeyName = `${sdRaw.sourceColumn}Key`;
 
-    const parentCols = validColumnsByTable.get(sd.parentDimension);
-    if (!parentCols || !parentCols.has(sd.sourceColumn)) {
-      warnings.push(
-        `Sous-dimension ignorée (colonne "${sd.sourceColumn}" inexistante dans "${sd.parentDimension}"): ${sd.name}`,
-      );
-      return false;
-    }
+      const sd = { ...sdRaw, parentDimension: normalizedParent, generatedPrimaryKey: enforcedKeyName };
 
-    if (cleanDimensions.includes(sd.name) || usedNames.has(sd.name)) {
-      warnings.push(`Sous-dimension ignorée (nom "${sd.name}" en conflit avec une table existante)`);
-      return false;
-    }
+      if (String(sd.name).toLowerCase().includes('dimtemps') || String(sd.parentDimension).toLowerCase().includes('dimtemps')) {
+        warnings.push(`Sous-dimension ignorée (confusion avec DimTemps, géré séparément): ${sd.name}`);
+        return null;
+      }
 
-    usedNames.add(sd.name);
-    return true;
-  });
+      if (!cleanDimensions.includes(sd.parentDimension)) {
+        warnings.push(`Sous-dimension ignorée (parent "${sd.parentDimension}" n'est pas une dimension valide): ${sd.name}`);
+        return null;
+      }
+
+      const parentCols = validColumnsByTable.get(sd.parentDimension);
+      if (!parentCols || !parentCols.has(sd.sourceColumn)) {
+        warnings.push(
+          `Sous-dimension ignorée (colonne "${sd.sourceColumn}" inexistante dans "${sd.parentDimension}"): ${sd.name}`,
+        );
+        return null;
+      }
+
+      if (cleanDimensions.includes(sd.name) || usedNames.has(sd.name)) {
+        warnings.push(`Sous-dimension ignorée (nom "${sd.name}" en conflit avec une table existante)`);
+        return null;
+      }
+
+      usedNames.add(sd.name);
+      return sd as SubDimension;
+    })
+    .filter((sd): sd is SubDimension => sd !== null);
 }
+
  private validateAndClean(
     parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
     validTableNames: Set<string>,
@@ -541,41 +558,53 @@ private validateSubDimensions(
       }
     }
 
-    // --- Génération automatique et complète de DimTemps (jamais laissée à l'IA) ---
-    const factTableMeta = metadata.find((table) => cleanFacts.includes(table[0]?.sourceTable));
-    const dateColumnInFact = factTableMeta?.find((col) => col.dataType.toLowerCase().includes('date'));
-    const hasDateInFact = Boolean(dateColumnInFact);
+   // --- Génération automatique et complète de DimTemps (jamais laissée à l'IA) ---
+    // Cherche une colonne date pour CHAQUE fait, pas seulement le premier (cas constellation)
+    const factsWithDate = cleanFacts
+      .map((factName) => {
+        const factMeta = metadata.find((table) => table[0]?.sourceTable === factName);
+        const dateCol = factMeta?.find((col) => col.dataType.toLowerCase().includes('date'));
+        return dateCol ? { factName, dateCol } : null;
+      })
+      .filter((x): x is { factName: string; dateCol: ColumnMetadata } => x !== null);
 
     let generatedDimensions: any[] = [];
     let factColumnTransformations: any[] = [];
     const finalConfirmedRelations = [...confirmedRelations];
 
-    if (hasDateInFact && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
-      warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans la table de faits)');
+    if (factsWithDate.length > 0 && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
+      warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans au moins une table de faits)');
       cleanDimensions.push('DimTemps');
     }
 
     const dimTempsPresent = cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'));
-    if (dimTempsPresent && dateColumnInFact && cleanFacts.length > 0) {
-      const { generatedDimension, factTransformation, relation } = this.buildDimTempsStructure(
-        cleanFacts[0],
-        dateColumnInFact.columnName,
+    if (dimTempsPresent && factsWithDate.length > 0) {
+      // La structure de DimTemps (colonnes) n'est créée qu'une seule fois, partagée par tous les faits
+      const { generatedDimension } = this.buildDimTempsStructure(
+        factsWithDate[0].factName,
+        factsWithDate[0].dateCol.columnName,
       );
       generatedDimensions.push(generatedDimension);
-      factColumnTransformations.push(factTransformation);
-      finalConfirmedRelations.push(relation);
-      warnings.push(
-        `Structure DimTemps générée : ${dateColumnInFact.columnName} → ${factTransformation.newColumn} (FK vers DimTemps.DateKey)`,
-      );
+
+      // Une relation distincte est générée pour CHAQUE fait ayant sa propre colonne date
+      for (const { factName, dateCol } of factsWithDate) {
+        const { factTransformation, relation } = this.buildDimTempsStructure(factName, dateCol.columnName);
+        factColumnTransformations.push(factTransformation);
+        finalConfirmedRelations.push(relation);
+        warnings.push(
+          `Structure DimTemps liée à ${factName} : ${dateCol.columnName} → ${factTransformation.newColumn} (FK vers DimTemps.DateKey)`,
+        );
+      }
     }
 
    // --- Validation des sous-dimensions proposées par l'IA ---
     const subDimensions = this.validateSubDimensions(
-      (parsed as any).subDimensions,
-      validColumnsByTable,
-      cleanDimensions,
-      warnings,
-    );
+  (parsed as any).subDimensions,
+  validColumnsByTable,
+  cleanDimensions,
+  warnings,
+  validTableNames,
+);
 
    const tableAttributes = this.buildTableAttributes(
   cleanDimensions,
