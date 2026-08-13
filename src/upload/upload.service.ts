@@ -11,10 +11,10 @@ export interface ColumnMetadata {
   dataType: string;
   cardinality: number;
   nullPercentage: number;
+  rowCount: number; // ← AJOUTER (OBLIGATOIRE, pas optionnel)
   sampleValues: string[];
   isLikelyKey: boolean;
   isSensitive: boolean;
-  rowCount?: number; // ← OK
   min?: string | number;
   max?: string | number;
   detectedPattern?: string;
@@ -271,91 +271,92 @@ export class UploadService {
   }
 
   private async buildMetadataForTable(pool: sql.ConnectionPool, tableName: string): Promise<ColumnMetadata[]> {
-    const columnsResult = await pool.request().query(`
-      SELECT COLUMN_NAME, DATA_TYPE
-      FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_NAME = '${tableName}'
-      ORDER BY ORDINAL_POSITION
+  const columnsResult = await pool.request().query(`
+    SELECT COLUMN_NAME, DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = '${tableName}'
+    ORDER BY ORDINAL_POSITION
+  `);
+
+  const [{ total }] = (await pool.request().query(`SELECT COUNT(*) as total FROM [${tableName}]`)).recordset;
+
+  const metadata: ColumnMetadata[] = [];
+
+  for (const col of columnsResult.recordset) {
+    const colName = col.COLUMN_NAME;
+    const sqlType = col.DATA_TYPE;
+
+    const [stats] = (await pool.request().query(`
+      SELECT
+        COUNT(DISTINCT [${colName}]) as cardinality,
+        SUM(CASE WHEN [${colName}] IS NULL THEN 1 ELSE 0 END) as nullCount
+      FROM [${tableName}]
+    `)).recordset;
+
+    const isSensitiveByUniqueness = this.isSensitiveColumn(sqlType, stats.cardinality, total);
+
+    const samplesResult = await pool.request().query(`
+      SELECT DISTINCT TOP 3 [${colName}] as val
+      FROM [${tableName}]
+      WHERE [${colName}] IS NOT NULL
     `);
+    const rawSamples = samplesResult.recordset.map((r) => this.formatSampleValue(r.val));
 
-    const [{ total }] = (await pool.request().query(`SELECT COUNT(*) as total FROM [${tableName}]`)).recordset;
+    let isSensitive = isSensitiveByUniqueness;
+    let detectedPattern: string | undefined;
 
-    const metadata: ColumnMetadata[] = [];
-
-    for (const col of columnsResult.recordset) {
-      const colName = col.COLUMN_NAME;
-      const sqlType = col.DATA_TYPE;
-
-      const [stats] = (await pool.request().query(`
-        SELECT
-          COUNT(DISTINCT [${colName}]) as cardinality,
-          SUM(CASE WHEN [${colName}] IS NULL THEN 1 ELSE 0 END) as nullCount
-        FROM [${tableName}]
-      `)).recordset;
-
-      const isSensitiveByUniqueness = this.isSensitiveColumn(sqlType, stats.cardinality, total);
-
-      const samplesResult = await pool.request().query(`
-        SELECT DISTINCT TOP 3 [${colName}] as val
-        FROM [${tableName}]
-        WHERE [${colName}] IS NOT NULL
-      `);
-      const rawSamples = samplesResult.recordset.map((r) => this.formatSampleValue(r.val));
-
-      let isSensitive = isSensitiveByUniqueness;
-      let detectedPattern: string | undefined;
-
-      if (sqlType.toLowerCase().includes('varchar')) {
-        detectedPattern = this.detectPattern(rawSamples.map(String));
-        if (detectedPattern === 'email' || detectedPattern === 'phone') {
-          isSensitive = true;
-        }
+    if (sqlType.toLowerCase().includes('varchar')) {
+      detectedPattern = this.detectPattern(rawSamples.map(String));
+      if (detectedPattern === 'email' || detectedPattern === 'phone') {
+        isSensitive = true;
       }
-
-      const meta: ColumnMetadata = {
-        sourceTable: tableName,
-        columnName: colName,
-        dataType: sqlType,
-        cardinality: stats.cardinality,
-        nullPercentage: total > 0 ? Math.round((stats.nullCount / total) * 100) : 0,
-        sampleValues: isSensitive ? [] : rawSamples.map(String),
-        isLikelyKey: total > 0 && stats.cardinality === total - stats.nullCount,
-        isSensitive,
-      };
-      if (detectedPattern) meta.detectedPattern = detectedPattern;
-
-      // Longueur moyenne/max des chaînes — utile pour distinguer un code court d'un texte libre
-      if (sqlType.toLowerCase().includes('varchar')) {
-        const [lengthStats] = (await pool.request().query(`
-          SELECT
-            AVG(CAST(LEN([${colName}]) AS FLOAT)) as avgLen,
-            MAX(LEN([${colName}])) as maxLen
-          FROM [${tableName}]
-          WHERE [${colName}] IS NOT NULL
-        `)).recordset;
-        if (lengthStats.avgLen !== null) {
-          meta.avgLength = Math.round(lengthStats.avgLen * 10) / 10;
-          meta.maxLength = lengthStats.maxLen;
-        }
-      }
-
-      if (['int', 'decimal', 'numeric', 'float', 'date', 'datetime'].includes(sqlType.toLowerCase())) {
-        const [minMax] = (await pool.request().query(`
-          SELECT MIN([${colName}]) as minVal, MAX([${colName}]) as maxVal
-          FROM [${tableName}]
-          WHERE [${colName}] IS NOT NULL
-        `)).recordset;
-        if (minMax.minVal !== null) {
-          meta.min = this.formatSampleValue(minMax.minVal);
-          meta.max = this.formatSampleValue(minMax.maxVal);
-        }
-      }
-
-      metadata.push(meta);
     }
 
-    return metadata;
+    const meta: ColumnMetadata = {
+      sourceTable: tableName,
+      columnName: colName,
+      dataType: sqlType,
+      cardinality: stats.cardinality,
+      nullPercentage: total > 0 ? Math.round((stats.nullCount / total) * 100) : 0,
+      rowCount: total, // ← AJOUT OBLIGATOIRE
+      sampleValues: isSensitive ? [] : rawSamples.map(String),
+      isLikelyKey: total > 0 && stats.cardinality === total - stats.nullCount,
+      isSensitive,
+    };
+    if (detectedPattern) meta.detectedPattern = detectedPattern;
+
+    // Longueur moyenne/max des chaînes
+    if (sqlType.toLowerCase().includes('varchar')) {
+      const [lengthStats] = (await pool.request().query(`
+        SELECT
+          AVG(CAST(LEN([${colName}]) AS FLOAT)) as avgLen,
+          MAX(LEN([${colName}])) as maxLen
+        FROM [${tableName}]
+        WHERE [${colName}] IS NOT NULL
+      `)).recordset;
+      if (lengthStats.avgLen !== null) {
+        meta.avgLength = Math.round(lengthStats.avgLen * 10) / 10;
+        meta.maxLength = lengthStats.maxLen;
+      }
+    }
+
+    if (['int', 'decimal', 'numeric', 'float', 'date', 'datetime'].includes(sqlType.toLowerCase())) {
+      const [minMax] = (await pool.request().query(`
+        SELECT MIN([${colName}]) as minVal, MAX([${colName}]) as maxVal
+        FROM [${tableName}]
+        WHERE [${colName}] IS NOT NULL
+      `)).recordset;
+      if (minMax.minVal !== null) {
+        meta.min = this.formatSampleValue(minMax.minVal);
+        meta.max = this.formatSampleValue(minMax.maxVal);
+      }
+    }
+
+    metadata.push(meta);
   }
+
+  return metadata;
+}
 
   private formatSampleValue(val: any): string | number {
     if (val instanceof Date) {

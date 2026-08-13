@@ -91,18 +91,43 @@ export class AiService {
 private getSubDimensionCandidateSet(metadata: ColumnMetadata[][]): Set<string> {
   const candidates = new Set<string>();
   const excludedPatterns = ['firstname', 'lastname', 'fullname', 'name', 'title', 'email', 'phone', 'address', 'id', 'code'];
+  const MIN_ROWS_TO_CONSIDER = 5;
 
+  console.log('[DEBUG] === getSubDimensionCandidateSet ===');
+  
   for (const table of metadata) {
-    // Récupérer le nombre total de lignes
-    const totalRows = (table[0] as any)?.rowCount ?? 0;
-    if (totalRows === 0) continue;
+    if (table.length === 0) continue;
+    
+    const sourceTable = table[0].sourceTable;
+    const rowCount = table[0].rowCount;
+    console.log(`[DEBUG] Table: ${sourceTable}, rowCount: ${rowCount}, type: ${typeof rowCount}`);
+    
+    if (rowCount === undefined || rowCount === null) {
+      console.log(`[DEBUG] ⚠️ rowCount est undefined/null pour ${sourceTable} !`);
+      continue;
+    }
+    
+    if (rowCount === 0 || rowCount < MIN_ROWS_TO_CONSIDER) {
+      console.log(`[DEBUG] Table ${sourceTable} exclue (${rowCount} lignes < ${MIN_ROWS_TO_CONSIDER})`);
+      continue;
+    }
+
+    // 🔥 Seuil adaptatif selon la taille de la table
+    let maxRatio;
+    if (rowCount <= 20) {
+      maxRatio = 0.7;  // Petite table : plus tolérant
+    } else if (rowCount <= 50) {
+      maxRatio = 0.5;  // Table moyenne
+    } else {
+      maxRatio = 0.3;  // Grande table : plus strict
+    }
 
     for (const col of table) {
       const normalizedColName = col.columnName.toLowerCase().replace(/[_\s-]/g, '');
       const isExcluded = excludedPatterns.some((p) => normalizedColName.includes(p));
+      const cardinalityRatio = col.cardinality / rowCount;
 
-      // 🔥 Calcul du ratio cardinalité / total lignes
-      const cardinalityRatio = col.cardinality / totalRows;
+      console.log(`[DEBUG]   Colonne: ${col.columnName}, cardinalité: ${col.cardinality}, ratio: ${cardinalityRatio.toFixed(3)}, exclue: ${isExcluded}`);
 
       if (
         col.dataType.toLowerCase().includes('varchar') &&
@@ -110,12 +135,15 @@ private getSubDimensionCandidateSet(metadata: ColumnMetadata[][]): Set<string> {
         !isExcluded &&
         col.cardinality > 1 &&
         col.cardinality <= 15 &&
-        cardinalityRatio < 0.5  // Moins de 50% des lignes
+        cardinalityRatio < maxRatio
       ) {
-        candidates.add(`${col.sourceTable}.${col.columnName}`);
+        console.log(`[DEBUG] ✅ CANDIDAT: ${sourceTable}.${col.columnName}`);
+        candidates.add(`${sourceTable}.${col.columnName}`);
       }
     }
   }
+
+  console.log(`[DEBUG] Total candidats: ${candidates.size}`);
   return candidates;
 }
 
@@ -223,23 +251,23 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
   let lastError: string | null = null;
   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
     try {
+      // 🔥 Appels séquentiels (ou parallèles selon préférence)
       const rawResponse = await this.callOllama(prompt);
+      const subDimensions = await this.detectSubDimensions(metadata);
+
       const parsed = this.parseAiResponse(rawResponse) as any;
 
-      // 🔥 RECONSTRUCTION DES RELATIONS DEPUIS LES INDEXES
-      const selectedRelations = (parsed.validRelationIndexes as number[])
-        .filter((i) => typeof i === 'number' && i >= 0 && i < preFilterRelations.length)
-        .map((i) => ({
-          ...preFilterRelations[i],
-          // Nettoyer les noms (enlever staging_)
-          tableA: preFilterRelations[i].tableA.replace(/^staging_/i, ''),
-          tableB: preFilterRelations[i].tableB.replace(/^staging_/i, ''),
+      // 🔥 NOUVEAU : Accepter toutes les relations par défaut, sauf celles rejetées
+      const rejectedIndexes = new Set((parsed.rejectedRelationIndexes as number[]) ?? []);
+
+      const selectedRelations = preFilterRelations
+        .filter((_, i) => !rejectedIndexes.has(i))
+        .map((r) => ({
+          ...r,
+          tableA: r.tableA.replace(/^staging_/i, ''),
+          tableB: r.tableB.replace(/^staging_/i, ''),
         }));
 
-      // 🔥 Récupérer les sous-dimensions du modèle
-      const subDimensions = parsed.subDimensions ?? [];
-
-      // 🔥 Appeler validateAndClean avec les relations reconstruites
       const validated = this.validateAndClean(
         {
           dimensions: parsed.dimensions ?? [],
@@ -266,7 +294,9 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
     `L'IA n'a pas réussi à produire un schéma valide après ${this.MAX_RETRIES} tentatives. Dernière erreur: ${lastError}`,
   );
 }
-  private findSubDimensionCandidates(metadata: ColumnMetadata[][]): string {
+
+
+ private findSubDimensionCandidates(metadata: ColumnMetadata[][]): string {
   const set = this.getSubDimensionCandidateSet(metadata);
   if (set.size === 0) return 'aucun candidat détecté';
   
@@ -453,7 +483,6 @@ private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[
     `${i}: ${r.tableA}.${r.columnA} ↔ ${r.tableB}.${r.columnB}`
   );
 
-  const subDimCandidates = this.findSubDimensionCandidates(metadata);
   const dateHint = hasDateColumn
     ? ' If relevant, add "DimTemps" to "dimensions" (it is generated automatically, do not worry about its columns or relations).'
     : '';
@@ -464,14 +493,13 @@ ${JSON.stringify(compactMetadata)}
 Relations pré-détectées (numérotées) :
 ${numberedRelations.join('\n')}
 
-TASK:
-1. Classify each table as dimension or fact. "dimensions" and "facts" MUST be arrays of plain STRINGS only, never objects.${dateHint}
-2. From the numbered relations above, list the INDEX NUMBERS of relations that make sense in "validRelationIndexes": [0, 1, 2, ...]. Do NOT invent new relations, only pick from the numbered list.
-3. Sub-dimensions from: ${subDimCandidates || 'none'}
-   Only real business categories (not names/titles/ids). Format: {"name":"DimX","parentDimension":"table","sourceColumn":"col"}
+TASK 1 — Classify each TABLE (not column) as dimension or fact.
+"dimensions" and "facts" MUST contain table names ONLY, NEVER "table.column" format.${dateHint}
+
+TASK 2 — All relations above are considered valid by default. ONLY list index numbers to REJECT in "rejectedRelationIndexes" if a relation is clearly wrong (e.g. connects two unrelated columns). If all relations look fine, leave it empty: [].
 
 ⚠️ Reply ONLY with valid JSON:
-{"dimensions":[],"facts":[],"validRelationIndexes":[],"subDimensions":[]}`;
+{"dimensions":[],"facts":[],"rejectedRelationIndexes":[]}`;
 }
 //   private async callOllama(prompt: string): Promise<string> {
 //   let response: Response;
@@ -644,47 +672,46 @@ private async callOllama(prompt: string): Promise<string> {
   private parseAiResponse(rawResponse: string): {
   dimensions: unknown[];
   facts: unknown[];
-  validRelationIndexes: unknown[];
+  rejectedRelationIndexes: unknown[];
   subDimensions: unknown[];
 } {
-  // 1. Nettoyage initial
   let cleaned = rawResponse
     .replace(/```json\s*/g, '')
     .replace(/```\s*/g, '')
     .trim();
 
-  // 2. Extraire le JSON
   const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     cleaned = jsonMatch[0];
   }
 
-  // 3. Supprimer tout après le dernier }
   const lastBrace = cleaned.lastIndexOf('}');
   if (lastBrace > 0 && lastBrace < cleaned.length - 1) {
     cleaned = cleaned.substring(0, lastBrace + 1);
   }
+
+  // Réparer le pattern "clé:""valeur"" → "clé":"valeur"
+  cleaned = cleaned.replace(/"(\w+):""([^"]*)""/g, '"$1":"$2"');
 
   try {
     const parsed = JSON.parse(cleaned);
     return {
       dimensions: parsed.dimensions ?? [],
       facts: parsed.facts ?? [],
-      validRelationIndexes: parsed.validRelationIndexes ?? [],
+      rejectedRelationIndexes: parsed.rejectedRelationIndexes ?? [],
       subDimensions: parsed.subDimensions ?? [],
     };
   } catch (e) {
     console.error('[parseAiResponse] Erreur parsing:', e.message);
     console.error('[parseAiResponse] cleaned:', cleaned.substring(0, 500));
-    
-    // Fallback
+
     try {
       const repaired = cleaned.replace(/'/g, '"');
       const parsed = JSON.parse(repaired);
       return {
         dimensions: parsed.dimensions ?? [],
         facts: parsed.facts ?? [],
-        validRelationIndexes: parsed.validRelationIndexes ?? [],
+        rejectedRelationIndexes: parsed.rejectedRelationIndexes ?? [],
         subDimensions: parsed.subDimensions ?? [],
       };
     } catch (e2) {
@@ -695,31 +722,27 @@ private async callOllama(prompt: string): Promise<string> {
   }
 }
 
-  private detectLikelyFactTable(metadata: ColumnMetadata[][]): string | null {
-    let bestCandidate: string | null = null;
-    let bestScore = 0;
+ private detectLikelyFactTables(metadata: ColumnMetadata[][]): string[] {
+  const candidates: { name: string; score: number }[] = [];
 
-    for (const table of metadata) {
-      if (table.length === 0) continue;
-      const tableName = table[0].sourceTable;
+  for (const table of metadata) {
+    if (table.length === 0) continue;
+    const tableName = table[0].sourceTable;
 
-      const foreignKeyCount = table.filter(
-        (col) => col.columnName.toLowerCase().endsWith('key') && !col.isLikelyKey,
-      ).length;
-      const measureCount = table.filter(
-        (col) =>
-          this.isNumericType(col.dataType) && !col.isLikelyKey && !col.columnName.toLowerCase().endsWith('key'),
-      ).length;
+    const foreignKeyCount = table.filter(
+      (col) => col.columnName.toLowerCase().endsWith('key') && !col.isLikelyKey,
+    ).length;
+    const measureCount = table.filter(
+      (col) =>
+        this.isNumericType(col.dataType) && !col.isLikelyKey && !col.columnName.toLowerCase().endsWith('key'),
+    ).length;
 
-      const score = foreignKeyCount * 2 + measureCount;
-      if (score > bestScore) {
-        bestScore = score;
-        bestCandidate = tableName;
-      }
-    }
-
-    return bestScore >= 3 ? bestCandidate : null;
+    const score = foreignKeyCount * 2 + measureCount;
+    if (score >= 3) candidates.push({ name: tableName, score });
   }
+
+  return candidates.sort((a, b) => b.score - a.score).map((c) => c.name);
+}
 
   private isNumericType(dataType: string): boolean {
     return ['int', 'decimal', 'numeric', 'float'].some((t) => dataType.toLowerCase().includes(t));
@@ -784,7 +807,7 @@ private validateSubDimensions(
       const enforcedKeyName = `${sdRaw.sourceColumn}Key`;
       const sd = { ...sdRaw, parentDimension: normalizedParent, generatedPrimaryKey: enforcedKeyName };
 
-      // ✅ NOUVEAU : rejet si hors liste de candidats calculée par le code
+      // ✅ REJET si hors liste de candidats calculée par le code
       if (!candidateSet.has(`${normalizedParent}.${sd.sourceColumn}`)) {
         warnings.push(
           `Sous-dimension ignorée (hors liste de candidats validés): ${sd.name} (${normalizedParent}.${sd.sourceColumn})`
@@ -814,6 +837,108 @@ private validateSubDimensions(
       return sd as SubDimension;
     })
     .filter((sd): sd is SubDimension => sd !== null);
+}
+// private buildSubDimensionPrompt(candidateLabels: string[]): string {
+//   return `From this list of candidates (format: table.column), pick the ones that represent a REAL business category (not personal names, IDs, or one-off attributes):
+
+// ${candidateLabels.join('\n')}
+
+// ✅ GOOD examples (pick these if they are in the list):
+// - staging_Products.Category → {"name":"DimCategory","parentDimension":"staging_Products","sourceColumn":"Category"}
+// - staging_Customers.Region → {"name":"DimRegion","parentDimension":"staging_Customers","sourceColumn":"Region"}
+// - staging_Returns.ReturnReason → {"name":"DimReturnReason","parentDimension":"staging_Returns","sourceColumn":"ReturnReason"}
+
+// ❌ BAD examples (DO NOT pick these):
+// - staging_Employees.FirstName (personal name, not a business category)
+// - staging_Products.ProductName (product name, not a category)
+// - staging_Resellers.ResellerName (name, not a category)
+
+// For each one you pick, split it into two fields:
+// - part BEFORE the dot → "parentDimension"
+// - part AFTER the dot → "sourceColumn"
+
+// Reply ONLY with valid JSON, this exact format:
+// {"subDimensions":[{"name":"DimCategory","parentDimension":"staging_Products","sourceColumn":"Category"}]}
+
+// If none qualify, reply: {"subDimensions":[]}`;
+// }
+
+private buildSubDimensionPrompt(candidateLabels: string[]): string {
+  // Construire un exemple dynamique
+  let example = '';
+  const exampleCount = Math.min(candidateLabels.length, 3);
+  
+  if (candidateLabels.length >= 2) {
+    const examples = candidateLabels.slice(0, exampleCount).map(label => {
+      const parts = label.split('.');
+      const table = parts[0];
+      const col = parts[1].split(' ')[0];
+      return `{"name":"Dim${col}","parentDimension":"${table}","sourceColumn":"${col}"}`;
+    });
+    
+    example = `
+✅ EXAMPLE: It is NORMAL to pick MULTIPLE candidates (0, 1, 2, or more):
+{"subDimensions":[${examples.join(', ')}]}`;
+  } else if (candidateLabels.length === 1) {
+    const first = candidateLabels[0];
+    const parts = first.split('.');
+    const table = parts[0];
+    const col = parts[1].split(' ')[0];
+    example = `
+✅ EXAMPLE: If you think it's valid:
+{"subDimensions":[{"name":"Dim${col}","parentDimension":"${table}","sourceColumn":"${col}"}]}`;
+  }
+
+  return `From this list of candidates (format: table.column), pick 0 or more that represent a REAL business category (not personal names, IDs, or one-off attributes):
+
+${candidateLabels.join('\n')}
+${example}
+
+⚠️ REQUIRED FIELDS for EACH sub-dimension:
+- "name": MUST start with "Dim" + the column name (e.g., "DimCountry")
+- "parentDimension": the table name (part BEFORE the dot)
+- "sourceColumn": the column name (part AFTER the dot)
+
+❌ DO NOT forget "name" - it is MANDATORY!
+❌ DO NOT send objects without "name"!
+
+✅ CORRECT: {"name":"DimCountry","parentDimension":"staging_SalesTerritory","sourceColumn":"SalesTerritoryCountry"}
+❌ INCORRECT: {"parentDimension":"staging_SalesTerritory","sourceColumn":"SalesTerritoryCountry"}
+
+You can pick 0, 1, 2, or ALL candidates — it's perfectly normal to have multiple sub-dimensions.
+If none qualify, reply: {"subDimensions":[]}
+
+⚠️ Reply ONLY with valid JSON.`;
+}
+
+private async detectSubDimensions(metadata: ColumnMetadata[][]): Promise<any[]> {
+  const candidateSet = this.getSubDimensionCandidateSet(metadata);
+  if (candidateSet.size === 0) return [];
+
+  const candidateLabels: string[] = [];
+  for (const table of metadata) {
+    for (const col of table) {
+      if (candidateSet.has(`${col.sourceTable}.${col.columnName}`)) {
+        candidateLabels.push(`${col.sourceTable}.${col.columnName} (${col.cardinality} valeurs distinctes)`);
+      }
+    }
+  }
+
+  const prompt = this.buildSubDimensionPrompt(candidateLabels);
+
+  try {
+    const rawResponse = await this.callOllama(prompt);
+    let cleaned = rawResponse.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) cleaned = jsonMatch[0];
+    cleaned = cleaned.replace(/"(\w+):""([^"]*)""/g, '"$1":"$2"');
+
+    const parsed = JSON.parse(cleaned);
+    return parsed.subDimensions ?? [];
+  } catch (err) {
+    console.warn('[detectSubDimensions] Échec, sous-dimensions ignorées:', err.message);
+    return []; // en cas d'échec, on continue sans bloquer le schéma principal
+  }
 }
 
 //  private validateAndClean(
@@ -1367,15 +1492,16 @@ private validateAndClean(
   }
 
   // Fallback si aucun fait n'est identifié
-  if (cleanFacts.length === 0) {
-    const fallbackFact = this.detectLikelyFactTable(metadata);
-    if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
-      warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
-      cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
-      cleanFacts.push(fallbackFact);
-    }
+    // Fallback élargi : récupère toutes les tables à fort profil "fait" mal classées en dimension
+const likelyFacts = this.detectLikelyFactTables(metadata);
+for (const candidate of likelyFacts) {
+  if (cleanDimensions.includes(candidate) && !cleanFacts.includes(candidate)) {
+    warnings.push(`${candidate} reclassée en fait par heuristique de secours (profil fort: clés étrangères + mesures)`);
+    cleanDimensions.splice(cleanDimensions.indexOf(candidate), 1);
+    cleanFacts.push(candidate);
   }
-
+}
+  
   // --- 2. Validation structurelle des relations (avec normalizedValidColumns) ---
   const structurallyValid = (r: any): boolean => {
     if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
@@ -1436,17 +1562,13 @@ private validateAndClean(
 // Les relations sont déjà reconstruites depuis les indexes, on les garde telles quelles
 let confirmedRelations = parsed.confirmedRelations
   .filter((r: any) => r && r.tableA && r.columnA && r.tableB && r.columnB)
-  .map((r: any) => ({
-    ...r,
-    reason: r.reason || 'relation_confirmee_par_ia'
-  }));
+  .filter(isValidRelation)  // ← remettre ce filtre
+  .map((r: any) => ({...r, reason: r.reason || 'relation_confirmee_par_ia'}));
 
 let additionalRelations = parsed.additionalRelations
   .filter((r: any) => r && r.tableA && r.columnA && r.tableB && r.columnB)
-  .map((r: any) => ({
-    ...r,
-    reason: r.reason || 'relation_additionnelle'
-  }));
+  .filter(isValidRelation)  // ← idem
+  .map((r: any) => ({...r, reason: r.reason || 'relation_additionnelle'}));
   // --- 5. Validation des sous-dimensions ---
   // Calculer la liste des candidats valides
   const candidateSet = this.getSubDimensionCandidateSet(metadata);
