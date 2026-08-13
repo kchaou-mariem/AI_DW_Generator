@@ -1,5 +1,6 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { UploadService, ColumnMetadata, CrossTableRelation } from '../upload/upload.service';
+import { Agent } from 'undici';
 
 export interface AiSchemaProposal {
   dimensions: string[];
@@ -23,14 +24,69 @@ export interface SubDimension {
 @Injectable()
 export class AiService {
   private readonly OLLAMA_URL = 'http://127.0.0.1:11434/api/generate';
-  private readonly MODEL = 'qwen2.5:7b-instruct';
+  private readonly MODEL = 'qwen2.5:3b-instruct';
   private readonly MAX_RETRIES = 3;
   private readonly DERIVED_DIMENSION_PREFIXES = ['dimtemps', 'dimdate', 'dimtime', 'dimcalendar'];
 
   constructor(private uploadService: UploadService) {}
 
+
   private toDisplayName(tableName: string): string {
   return tableName.replace(/^staging_/i, '');
+}
+
+// ✅ 1. D'abord les méthodes utilitaires (avant validateAndClean)
+  private isLegitimateDerivedDimension(tableName: unknown, hasDateColumn: boolean): boolean {
+    if (typeof tableName !== 'string') return false;
+    const normalized = tableName.toLowerCase().replace(/[_\s-]/g, '');
+    const looksLikeTimeDimension = this.DERIVED_DIMENSION_PREFIXES.some((p) => normalized.includes(p));
+    return looksLikeTimeDimension && hasDateColumn;
+  }
+
+  private normalizeTableEntry(entry: unknown, validTableNames: Set<string>): string | null {
+  let candidateName: string;
+
+  if (typeof entry === 'string') {
+    candidateName = entry;
+  } else if (entry && typeof entry === 'object') {
+    // ✅ Support du format {t: "tableName", c: [...]}
+    if ('t' in (entry as any) && typeof (entry as any).t === 'string') {
+      candidateName = String((entry as any).t);
+    } 
+    // ✅ Support du format {tableName: "tableName", columns: [...]}
+    else if ('tableName' in (entry as any) && typeof (entry as any).tableName === 'string') {
+      candidateName = String((entry as any).tableName);
+    }
+    // ✅ Support du format {name: "tableName", columns: [...]}
+    else if ('name' in (entry as any) && typeof (entry as any).name === 'string') {
+      candidateName = String((entry as any).name);
+    }
+    else {
+      return null;
+    }
+  } else {
+    return null;
+  }
+
+  // Nettoyer le nom (enlever les préfixes)
+  const cleanName = candidateName.replace(/^staging_/i, '');
+  
+  // Vérifier si le nom exact existe
+  if (validTableNames.has(candidateName)) return candidateName;
+  if (validTableNames.has(cleanName)) return cleanName;
+  
+  // Vérifier avec le préfixe staging_
+  const withPrefix = `staging_${cleanName}`;
+  if (validTableNames.has(withPrefix)) return withPrefix;
+
+  // Normalisation sans préfixe
+  const normalize = (s: string) => s.toLowerCase().replace(/^(staging_|dim|fact)/i, '').replace(/[_\s-]/g, '');
+  const normalizedCandidate = normalize(candidateName);
+  for (const realName of validTableNames) {
+    if (normalize(realName) === normalizedCandidate) return realName;
+  }
+
+  return candidateName;
 }
 
 private applyDisplayNames(result: Omit<AiSchemaProposal, 'rawResponse'>): Omit<AiSchemaProposal, 'rawResponse'> {
@@ -121,7 +177,7 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
 }
 
   async generateSchema(database: string): Promise<AiSchemaProposal> {
-    const metadata = await this.uploadService.buildMetadataForDatabase(database);
+    const metadata = await this.getMetadataWithCache(database);
     const preFilterRelations = this.uploadService.detectCrossTableRelations(metadata);
 
     const validTableNames = new Set(metadata.map((cols) => cols[0]?.sourceTable).filter(Boolean));
@@ -170,66 +226,326 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
   return candidates.length > 0 ? candidates.join(', ') : 'aucun candidat détecté';
 }
 
-  private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[], hasDateColumn: boolean): string {
-  const dateRule = hasDateColumn
-    ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps" dans "dimensions" — cette table est calculée automatiquement plus tard, elle n'a pas besoin d'exister dans les métadonnées fournies. Ne propose PAS de relation vers DimTemps toi-même, elle sera générée automatiquement.`
-    : '';
+//   private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[], hasDateColumn: boolean): string {
+//   const dateRule = hasDateColumn
+//     ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps" dans "dimensions" — cette table est calculée automatiquement plus tard, elle n'a pas besoin d'exister dans les métadonnées fournies. Ne propose PAS de relation vers DimTemps toi-même, elle sera générée automatiquement.`
+//     : '';
+
+//   const subDimCandidates = this.findSubDimensionCandidates(metadata);
+//   const hasSubDimCandidates = subDimCandidates !== 'aucun candidat détecté';
+
+//   const subDimRule = hasSubDimCandidates
+//     ? `\n6. Colonnes candidates pour une extraction en sous-dimension (faible cardinalité déjà détectée par calcul) : ${subDimCandidates}.
+// Si l'une d'elles mérite vraiment d'être extraite (catégorie métier claire, forte répétition), propose-la au format :
+// {"subDimensions": [{"name": "DimNomChoisi", "parentDimension": "nom_table_du_candidat", "sourceColumn": "nom_colonne_du_candidat", "generatedPrimaryKey": "NomCleGeneree"}]}
+// N'invente RIEN en dehors de cette liste de candidats. IMPORTANT : ignore complètement "DimTemps" pour cette règle — la dimension temporelle est gérée séparément et automatiquement, ne la mentionne jamais dans "subDimensions".`
+//     : `\n6. Aucune sous-dimension n'est à proposer ici. Laisse "subDimensions" à un tableau vide [].`;
+
+//   return `Tu es un architecte BI expert en modélisation de data warehouse.
+
+// Métadonnées des tables de staging :
+// ${JSON.stringify(metadata)}
+
+// Relations déjà détectées par un pré-filtre :
+// ${JSON.stringify(relations)}
+
+// RÈGLES STRICTES à respecter absolument :
+// 1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts". Ne jamais oublier une table, ne jamais en dupliquer une. Utilise EXCLUSIVEMENT les noms de tables tels qu'ils apparaissent dans les métadonnées, jamais un nom renommé.
+// 2. N'invente JAMAIS de nom de table ou de colonne qui n'existe pas dans les métadonnées fournies, sauf la dimension temporelle décrite ci-dessous.${dateRule}
+// 3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées (respecte la casse), sauf pour "DimTemps".
+// 4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES, jamais des objets.
+// 5. INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.${subDimRule}
+// 7. IMPORTANT — Constellation de faits : si tu identifies PLUSIEURS tables contenant chacune des mesures numériques agrégeables, tu DOIS les classer TOUTES dans "facts". Dans ce cas, assure-toi qu'au moins une dimension est reliée aux DEUX tables de faits.
+// 8. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
+
+// {"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"..."}],"subDimensions":[]}`;
+// }
+private metadataCache = new Map<string, { data: ColumnMetadata[][]; timestamp: number }>();
+private readonly CACHE_TTL = 60000; // 1 minute
+
+async getMetadataWithCache(database: string): Promise<ColumnMetadata[][]> {
+  const cached = this.metadataCache.get(database);
+  if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
+    console.log(`[Cache] Métadonnées utilisées depuis le cache pour ${database}`);
+    return cached.data;
+  }
+  
+  console.log(`[Cache] Chargement des métadonnées pour ${database}...`);
+  const data = await this.uploadService.buildMetadataForDatabase(database);
+  this.metadataCache.set(database, { data, timestamp: Date.now() });
+  return data;
+}
+
+// private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[], hasDateColumn: boolean): string {
+//   const dateRule = hasDateColumn
+//     ? `\n2b. Des colonnes de type date existent dans les données. Si pertinent, propose une dimension temporelle nommée exactement "DimTemps" dans "dimensions" — cette table est calculée automatiquement plus tard, elle n'a pas besoin d'exister dans les métadonnées fournies. Ne propose PAS de relation vers DimTemps toi-même, elle sera générée automatiquement.`
+//     : '';
+
+//   const subDimCandidates = this.findSubDimensionCandidates(metadata);
+//   const hasSubDimCandidates = subDimCandidates !== 'aucun candidat détecté';
+
+//   const subDimRule = hasSubDimCandidates
+//     ? `\n6. Colonnes candidates pour une extraction en sous-dimension (faible cardinalité déjà détectée par calcul) : ${subDimCandidates}.
+// Si l'une d'elles mérite vraiment d'être extraite (catégorie métier claire, forte répétition), propose-la au format :
+// {"subDimensions": [{"name": "DimNomChoisi", "parentDimension": "nom_table_du_candidat", "sourceColumn": "nom_colonne_du_candidat", "generatedPrimaryKey": "NomCleGeneree"}]}
+// N'invente RIEN en dehors de cette liste de candidats. IMPORTANT : ignore complètement "DimTemps" pour cette règle — la dimension temporelle est gérée séparément et automatiquement, ne la mentionne jamais dans "subDimensions".`
+//     : `\n6. Aucune sous-dimension n'est à proposer ici. Laisse "subDimensions" à un tableau vide [].`;
+
+//   // 🔥 OPTIMISATION 1: Métadonnées COMPACTES (réduction de 80-90%)
+//   const compactMetadata = metadata.map(table => ({
+//     t: table[0]?.sourceTable,                    // t = table name
+//     c: table.map(col => ({                       // c = columns
+//       n: col.columnName,                         // n = name
+//       d: col.dataType,                           // d = dataType
+//       k: col.isLikelyKey,                        // k = isKey
+//       f: col.columnName.toLowerCase().endsWith('key') || col.columnName.toLowerCase().includes('id') // f = foreign key suspect
+//     }))
+//   }));
+
+//   // 🔥 OPTIMISATION 2: Relations COMPACTES (limité à 30 max)
+//   const compactRelations = relations.slice(0, 30).map(r => ({
+//     A: r.tableA,
+//     a: r.columnA,
+//     B: r.tableB,
+//     b: r.columnB
+//   }));
+
+//   // ⚠️ MÊMES RÈGLES, NON MODIFIÉES
+//   return `Tu es un architecte BI expert en modélisation de data warehouse.
+
+// Métadonnées des tables de staging :
+// ${JSON.stringify(compactMetadata)}
+
+// Relations déjà détectées par un pré-filtre :
+// ${JSON.stringify(compactRelations)}
+
+// RÈGLES STRICTES à respecter absolument :
+// 1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts". Ne jamais oublier une table, ne jamais en dupliquer une. Utilise EXCLUSIVEMENT les noms de tables tels qu'ils apparaissent dans les métadonnées, jamais un nom renommé.
+// 2. N'invente JAMAIS de nom de table ou de colonne qui n'existe pas dans les métadonnées fournies, sauf la dimension temporelle décrite ci-dessous.${dateRule}
+// 3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées (respecte la casse), sauf pour "DimTemps".
+// 4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES, jamais des objets.
+// 5. INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.${subDimRule}
+// 7. IMPORTANT — Constellation de faits : si tu identifies PLUSIEURS tables contenant chacune des mesures numériques agrégeables, tu DOIS les classer TOUTES dans "facts". Dans ce cas, assure-toi qu'au moins une dimension est reliée aux DEUX tables de faits.
+// 8. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
+
+// {"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"..."}],"subDimensions":[]}`;
+// }
+
+
+private buildPrompt(metadata: ColumnMetadata[][], relations: CrossTableRelation[], hasDateColumn: boolean): string {
+  // 🔥 ULTRA-COMPACT
+  const compactMetadata = metadata.map(table => ({
+    t: table[0]?.sourceTable,
+    c: table
+      .filter(col => 
+        col.isLikelyKey || 
+        col.columnName.toLowerCase().includes('key') ||
+        col.columnName.toLowerCase().includes('id') ||
+        col.dataType.toLowerCase().includes('date') ||
+        col.dataType.toLowerCase().includes('varchar')
+      )
+      .map(col => col.columnName)
+      .join(', ')
+  }));
+
+  const compactRelations = relations.slice(0, 15).map(r => 
+    `${r.tableA}.${r.columnA}↔${r.tableB}.${r.columnB}`
+  );
 
   const subDimCandidates = this.findSubDimensionCandidates(metadata);
 
-  return `Tu es un architecte BI expert en modélisation de data warehouse.
+  return `BI expert. Tables:
+${JSON.stringify(compactMetadata)}
 
-Métadonnées des tables de staging :
-${JSON.stringify(metadata)}
+Relations (top 15):
+${JSON.stringify(compactRelations)}
 
-Relations déjà détectées par un pré-filtre :
-${JSON.stringify(relations)}
+RULES:
+1. Each table in dimensions/facts once.
+2. No invented names.${hasDateColumn ? ' Propose DimTemps.' : ''}
+3. Use exact names.
+4. ⚠️ dimensions = array of STRINGS only. Example: ["staging_Customers", "staging_Products"]
+5. ⚠️ facts = array of STRINGS only. Example: ["staging_Sales", "staging_Returns"]
+6. NO dim↔dim relations.
+7. Sub-dimensions from: ${subDimCandidates || 'none'}
+   Format: {"subDimensions": [{"name":"DimX","parentDimension":"table","sourceColumn":"col"}]}
+8. CRITICAL: Multiple facts MUST share a common dimension.
+9. ⚠️ confirmedRelations = array of OBJECTS with fields: tableA, columnA, tableB, columnB
+   Example: [{"tableA":"staging_Sales","columnA":"ProductKey","tableB":"staging_Products","columnB":"ProductKey"}]
 
-RÈGLES STRICTES à respecter absolument :
-1. CHAQUE table de staging présente dans les métadonnées doit apparaître EXACTEMENT UNE FOIS, soit dans "dimensions", soit dans "facts". Ne jamais oublier une table, ne jamais en dupliquer une. Utilise EXCLUSIVEMENT les noms de tables tels qu'ils apparaissent dans les métadonnées, jamais un nom renommé.
-2. N'invente JAMAIS de nom de table ou de colonne qui n'existe pas dans les métadonnées fournies, sauf la dimension temporelle décrite ci-dessous.${dateRule}
-3. Chaque relation doit utiliser des noms de tables et colonnes EXACTEMENT identiques à ceux des métadonnées (respecte la casse), sauf pour "DimTemps".
-4. "dimensions" et "facts" doivent être des tableaux de CHAÎNES DE CARACTÈRES SIMPLES, jamais des objets.
-5. INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
-6. Colonnes candidates pour une extraction en sous-dimension (faible cardinalité déjà détectée par calcul) : ${subDimCandidates}.
-Si l'une d'elles mérite vraiment d'être extraite (catégorie métier claire, forte répétition), propose-la au format :
-{"subDimensions": [{"name": "DimNomChoisi", "parentDimension": "nom_table_du_candidat", "sourceColumn": "nom_colonne_du_candidat", "generatedPrimaryKey": "NomCleGeneree"}]}
-N'invente RIEN en dehors de cette liste de candidats. IMPORTANT : ignore complètement "DimTemps" pour cette règle — la dimension temporelle est gérée séparément et automatiquement, ne la mentionne jamais dans "subDimensions".
-7. IMPORTANT — Constellation de faits : si tu identifies PLUSIEURS tables contenant chacune des mesures numériques agrégeables, tu DOIS les classer TOUTES dans "facts". Dans ce cas, assure-toi qu'au moins une dimension est reliée aux DEUX tables de faits.
-8. Réponds STRICTEMENT en JSON valide, sans texte avant/après, selon ce format exact :
+⚠️ CRITICAL: Reply ONLY with valid JSON, no extra text.
+⚠️ The response must start with { and end with }.
 
-{"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"...","reason":"..."}],"subDimensions":[]}`;
+JSON: {"dimensions":[],"facts":[],"confirmedRelations":[],"additionalRelations":[],"subDimensions":[]}`;
 }
 
-  private async callOllama(prompt: string): Promise<string> {
-    let response: Response;
-    try {
-      response = await fetch(this.OLLAMA_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: this.MODEL,
-          prompt,
-          stream: false,
-          format: 'json',
-          options: { temperature: 0.1 },
-        }),
-        signal: AbortSignal.timeout(600000),
-      });
-    } catch (err) {
-      console.error('Erreur fetch Ollama:', err);
+//   private async callOllama(prompt: string): Promise<string> {
+//   let response: Response;
+//   const promptTokensApprox = Math.round(prompt.length / 4); // estimation grossière
+//   console.log(`[Ollama] Envoi prompt (~${prompt.length} caractères, ~${promptTokensApprox} tokens estimés)`);
+
+//   const startedAt = Date.now();
+
+//   try {
+//     response = await fetch(this.OLLAMA_URL, {
+//   method: 'POST',
+//   headers: { 'Content-Type': 'application/json' },
+//   body: JSON.stringify({
+//     model: this.MODEL,
+//     prompt,
+//     stream: false,
+//     format: 'json',
+//     options: { temperature: 0.1 },
+//   }),
+//   signal: AbortSignal.timeout(600000),
+  
+// } as any);
+//   } catch (err) {
+//     console.error('Erreur fetch Ollama:', err);
+//     throw new InternalServerErrorException(
+//       `Impossible de contacter Ollama sur ${this.OLLAMA_URL}. Vérifie qu'il est bien lancé.`,
+//     );
+//   }
+
+//   if (!response.ok) {
+//     throw new InternalServerErrorException(`Ollama a répondu avec une erreur: ${response.status}`);
+//   }
+
+//   const data = await response.json();
+//   const totalMs = Date.now() - startedAt;
+
+//   // Ollama renvoie des durées en nanosecondes quand stream: false
+//   const toMs = (ns: number | undefined) => (ns ? (ns / 1_000_000).toFixed(0) : 'N/A');
+
+//   console.log('[Ollama] --- Timing détaillé ---');
+//   console.log(`[Ollama] Temps total mesuré (réseau inclus): ${totalMs} ms`);
+//   console.log(`[Ollama] load_duration (chargement modèle en mémoire): ${toMs(data.load_duration)} ms`);
+//   console.log(`[Ollama] prompt_eval_duration (lecture du prompt): ${toMs(data.prompt_eval_duration)} ms`);
+//   console.log(`[Ollama] prompt_eval_count (tokens du prompt): ${data.prompt_eval_count ?? 'N/A'}`);
+//   console.log(`[Ollama] eval_duration (génération de la réponse): ${toMs(data.eval_duration)} ms`);
+//   console.log(`[Ollama] eval_count (tokens générés): ${data.eval_count ?? 'N/A'}`);
+//   console.log('[Ollama] ------------------------');
+
+//   return data.response;
+// }
+
+private async callOllama(prompt: string): Promise<string> {
+  const startedAt = Date.now();
+  const promptTokensApprox = Math.round(prompt.length / 4);
+  console.log(`[Ollama] Envoi prompt (~${prompt.length} caractères, ~${promptTokensApprox} tokens estimés)`);
+
+  try {
+    const response = await fetch(this.OLLAMA_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: this.MODEL,
+        prompt,
+        stream: true,
+        options: { 
+          temperature: 0.1,
+          num_predict: 4096, // Augmenté pour éviter les réponses tronquées
+        },
+      }),
+      signal: AbortSignal.timeout(240000),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
       throw new InternalServerErrorException(
-        `Impossible de contacter Ollama sur ${this.OLLAMA_URL}. Vérifie qu'il est bien lancé.`,
+        `Ollama a répondu avec une erreur: ${response.status} - ${errorText}`
       );
     }
 
-    if (!response.ok) {
-      throw new InternalServerErrorException(`Ollama a répondu avec une erreur: ${response.status}`);
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new InternalServerErrorException('Impossible de lire le flux de réponse');
     }
 
-    const data = await response.json();
-    return data.response;
+    const decoder = new TextDecoder();
+    let fullResponse = '';
+    let chunkCount = 0;
+    let lastLogTime = Date.now();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        console.log(`[Ollama] Flux terminé. Total chunks: ${chunkCount}`);
+        break;
+      }
+
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n').filter(line => line.trim());
+
+      for (const line of lines) {
+        // Ignorer les lignes qui ne commencent pas par { (pas du JSON valide)
+        if (!line.trim().startsWith('{')) {
+          continue;
+        }
+
+        try {
+          const data = JSON.parse(line);
+          
+          if (data.response) {
+            fullResponse += data.response;
+            chunkCount++;
+
+            const now = Date.now();
+            if (now - lastLogTime > 5000) {
+              console.log(`[Ollama] Progression: ${fullResponse.length} caractères reçus...`);
+              lastLogTime = now;
+            }
+          }
+
+          if (data.done === true) {
+            console.log(`[Ollama] Génération terminée. Total caractères: ${fullResponse.length}`);
+            console.log(`[Ollama] Statistiques:`, {
+              total_duration: data.total_duration,
+              load_duration: data.load_duration,
+              prompt_eval_count: data.prompt_eval_count,
+              prompt_eval_duration: data.prompt_eval_duration,
+              eval_count: data.eval_count,
+              eval_duration: data.eval_duration,
+            });
+          }
+        } catch (e) {
+          // Ignorer silencieusement les lignes mal formées (normal en streaming)
+        }
+      }
+    }
+
+    const totalMs = Date.now() - startedAt;
+    const estimatedTokens = Math.round(fullResponse.length / 4);
+    
+    console.log(`[Ollama] --- RÉSUMÉ STREAMING ---`);
+    console.log(`[Ollama] Temps total: ${totalMs} ms`);
+    console.log(`[Ollama] Caractères reçus: ${fullResponse.length}`);
+    console.log(`[Ollama] Tokens estimés: ${estimatedTokens}`);
+    console.log(`[Ollama] Vitesse: ${Math.round(fullResponse.length / (totalMs / 1000))} caractères/seconde`);
+    console.log(`[Ollama] -------------------------`);
+
+    // Nettoyer la réponse des éventuels marqueurs Markdown
+    const cleanedResponse = fullResponse
+      .replace(/```json\s*/g, '')
+      .replace(/```\s*/g, '')
+      .trim();
+
+    return cleanedResponse;
+
+  } catch (err) {
+    console.error('[Ollama] Erreur fetch:', err);
+    
+    if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+      throw new InternalServerErrorException(
+        `Le modèle Ollama a mis trop de temps à répondre (2 minutes). Vérifie que le modèle "${this.MODEL}" est disponible.`
+      );
+    }
+    
+    throw new InternalServerErrorException(
+      `Impossible de contacter Ollama sur ${this.OLLAMA_URL}. Vérifie qu'il est bien lancé. Erreur: ${err.message}`
+    );
   }
+}
 
   private parseAiResponse(rawResponse: string): {
   dimensions: unknown[];
@@ -238,47 +554,56 @@ N'invente RIEN en dehors de cette liste de candidats. IMPORTANT : ignore complè
   additionalRelations: any[];
   subDimensions: unknown[];
 } {
-  const cleaned = rawResponse.replace(/```json|```/g, '').trim();
-  const parsed = JSON.parse(cleaned);
-  return {
-    dimensions: parsed.dimensions ?? [],
-    facts: parsed.facts ?? [],
-    confirmedRelations: parsed.confirmedRelations ?? [],
-    additionalRelations: parsed.additionalRelations ?? [],
-    subDimensions: parsed.subDimensions ?? [],
-  };
+  // 1. Nettoyage initial
+  let cleaned = rawResponse
+    .replace(/```json\s*/g, '')
+    .replace(/```\s*/g, '')
+    .trim();
+
+  // 2. Si la réponse contient "Given the" ou autre texte, extraire le JSON
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    cleaned = jsonMatch[0];
+  }
+
+  // 3. Supprimer tout après le dernier }
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (lastBrace > 0 && lastBrace < cleaned.length - 1) {
+    cleaned = cleaned.substring(0, lastBrace + 1);
+  }
+
+  // 4. Essayer de parser
+  try {
+    const parsed = JSON.parse(cleaned);
+    return {
+      dimensions: parsed.dimensions ?? [],
+      facts: parsed.facts ?? [],
+      confirmedRelations: parsed.confirmedRelations ?? [],
+      additionalRelations: parsed.additionalRelations ?? [],
+      subDimensions: parsed.subDimensions ?? [],
+    };
+  } catch (e) {
+    console.error('[parseAiResponse] Erreur parsing:', e.message);
+    console.error('[parseAiResponse] cleaned:', cleaned.substring(0, 500));
+    
+    // 5. Fallback : essayer de réparer le JSON
+    try {
+      const repaired = cleaned.replace(/'/g, '"');
+      const parsed = JSON.parse(repaired);
+      return {
+        dimensions: parsed.dimensions ?? [],
+        facts: parsed.facts ?? [],
+        confirmedRelations: parsed.confirmedRelations ?? [],
+        additionalRelations: parsed.additionalRelations ?? [],
+        subDimensions: parsed.subDimensions ?? [],
+      };
+    } catch (e2) {
+      throw new InternalServerErrorException(
+        `La réponse de l'IA n'est pas un JSON valide: ${e.message}`
+      );
+    }
+  }
 }
-
-  private isLegitimateDerivedDimension(tableName: unknown, hasDateColumn: boolean): boolean {
-    if (typeof tableName !== 'string') return false;
-    const normalized = tableName.toLowerCase().replace(/[_\s-]/g, '');
-    const looksLikeTimeDimension = this.DERIVED_DIMENSION_PREFIXES.some((p) => normalized.includes(p));
-    return looksLikeTimeDimension && hasDateColumn;
-  }
-
-  // Extrait un nom de table exploitable, que Qwen ait renvoyé une string ou un objet {tableName, columns}
-  private normalizeTableEntry(entry: unknown, validTableNames: Set<string>): string | null {
-    let candidateName: string;
-
-    if (typeof entry === 'string') {
-      candidateName = entry;
-    } else if (entry && typeof entry === 'object' && 'tableName' in (entry as any)) {
-      candidateName = String((entry as any).tableName);
-    } else {
-      return null;
-    }
-
-    if (validTableNames.has(candidateName)) return candidateName;
-
-    const normalize = (s: string) => s.toLowerCase().replace(/^(staging_|dim|fact)/i, '').replace(/[_\s-]/g, '');
-    const normalizedCandidate = normalize(candidateName);
-    for (const realName of validTableNames) {
-      if (normalize(realName) === normalizedCandidate) return realName;
-    }
-
-    return candidateName;
-  }
-
   private detectLikelyFactTable(metadata: ColumnMetadata[][]): string | null {
     let bestCandidate: string | null = null;
     let bestScore = 0;
@@ -401,233 +726,489 @@ private validateSubDimensions(
     .filter((sd): sd is SubDimension => sd !== null);
 }
 
- private validateAndClean(
-    parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
-    validTableNames: Set<string>,
-    validColumnsByTable: Map<string, Set<string>>,
-    metadata: ColumnMetadata[][],
-  ): Omit<AiSchemaProposal, 'rawResponse'> {
-    const warnings: string[] = [];
-    const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
+//  private validateAndClean(
+//     parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
+//     validTableNames: Set<string>,
+//     validColumnsByTable: Map<string, Set<string>>,
+//     metadata: ColumnMetadata[][],
+//   ): Omit<AiSchemaProposal, 'rawResponse'> {
+//     const warnings: string[] = [];
+//     const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
 
-    const isKnownOrDerived = (t: string, bucket: string): boolean => {
-      if (validTableNames.has(t)) return true;
-      if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
-        warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
-        return true;
-      }
-      warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
-      return false;
-    };
+//     const isKnownOrDerived = (t: string, bucket: string): boolean => {
+//       if (validTableNames.has(t)) return true;
+//       if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
+//         warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
+//         return true;
+//       }
+//       warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
+//       return false;
+//     };
 
-    const normalizedDimensions = parsed.dimensions
-      .map((t) => this.normalizeTableEntry(t, validTableNames))
-      .filter((t): t is string => t !== null);
-    const normalizedFacts = parsed.facts
-      .map((t) => this.normalizeTableEntry(t, validTableNames))
-      .filter((t): t is string => t !== null);
+//     const normalizedDimensions = parsed.dimensions
+//       .map((t) => this.normalizeTableEntry(t, validTableNames))
+//       .filter((t): t is string => t !== null);
+//     const normalizedFacts = parsed.facts
+//       .map((t) => this.normalizeTableEntry(t, validTableNames))
+//       .filter((t): t is string => t !== null);
 
-    const dimensions = normalizedDimensions.filter((t) => isKnownOrDerived(t, 'dimensions'));
-    const facts = normalizedFacts.filter((t) => isKnownOrDerived(t, 'facts'));
+//     const dimensions = normalizedDimensions.filter((t) => isKnownOrDerived(t, 'dimensions'));
+//     const facts = normalizedFacts.filter((t) => isKnownOrDerived(t, 'facts'));
 
-    const seen = new Set<string>();
-    const cleanFacts = facts.filter((t) => {
-      if (seen.has(t)) return false;
-      seen.add(t);
-      return true;
-    });
-    const cleanDimensions = dimensions.filter((t) => {
-      if (seen.has(t)) {
-        warnings.push(`Table ${t} classée à la fois en fait et dimension — gardée en fait uniquement`);
-        return false;
-      }
-      seen.add(t);
-      return true;
-    });
+//     const seen = new Set<string>();
+//     const cleanFacts = facts.filter((t) => {
+//       if (seen.has(t)) return false;
+//       seen.add(t);
+//       return true;
+//     });
+//     const cleanDimensions = dimensions.filter((t) => {
+//       if (seen.has(t)) {
+//         warnings.push(`Table ${t} classée à la fois en fait et dimension — gardée en fait uniquement`);
+//         return false;
+//       }
+//       seen.add(t);
+//       return true;
+//     });
 
-    for (const tableName of validTableNames) {
-      if (!seen.has(tableName)) {
-        warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
-        cleanDimensions.push(tableName);
-        seen.add(tableName);
-      }
-    }
+//     for (const tableName of validTableNames) {
+//       if (!seen.has(tableName)) {
+//         warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
+//         cleanDimensions.push(tableName);
+//         seen.add(tableName);
+//       }
+//     }
 
-    if (cleanFacts.length === 0) {
-      const fallbackFact = this.detectLikelyFactTable(metadata);
-      if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
-        warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
-        cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
-        cleanFacts.push(fallbackFact);
-      }
-    }
+//     if (cleanFacts.length === 0) {
+//       const fallbackFact = this.detectLikelyFactTable(metadata);
+//       if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
+//         warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
+//         cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
+//         cleanFacts.push(fallbackFact);
+//       }
+//     }
 
    
 
-    // --- Validation structurelle des relations proposées par l'IA ---
-    // Note : toute relation impliquant DimTemps proposée par l'IA est ignorée ici,
-    // car DimTemps est gérée intégralement par code juste après (colonnes + relation générées automatiquement)
-    const structurallyValid = (r: any): boolean => {
-      if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
-        warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
-        return false;
-      }
-      if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
-        warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
-        return false;
-      }
-      const colsA = validColumnsByTable.get(r.tableA);
-      if (!colsA || !colsA.has(r.columnA)) {
-        warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
-        return false;
-      }
-      const colsB = validColumnsByTable.get(r.tableB);
-      if (!colsB || !colsB.has(r.columnB)) {
-        warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
-        return false;
-      }
+//     // --- Validation structurelle des relations proposées par l'IA ---
+//     // Note : toute relation impliquant DimTemps proposée par l'IA est ignorée ici,
+//     // car DimTemps est gérée intégralement par code juste après (colonnes + relation générées automatiquement)
+//     const structurallyValid = (r: any): boolean => {
+//       if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
+//         warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
+//         return false;
+//       }
+//       if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
+//         warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
+//         return false;
+//       }
+//       const colsA = validColumnsByTable.get(r.tableA);
+//       if (!colsA || !colsA.has(r.columnA)) {
+//         warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
+//         return false;
+//       }
+//       const colsB = validColumnsByTable.get(r.tableB);
+//       if (!colsB || !colsB.has(r.columnB)) {
+//         warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
+//         return false;
+//       }
+//       return true;
+//     };
+
+//     const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
+
+//     const dimensionsLinkedToFact = new Set<string>();
+//     for (const r of allRelationsRaw) {
+//       if (cleanFacts.includes(r.tableA) && cleanDimensions.includes(r.tableB)) dimensionsLinkedToFact.add(r.tableB);
+//       if (cleanFacts.includes(r.tableB) && cleanDimensions.includes(r.tableA)) dimensionsLinkedToFact.add(r.tableA);
+//     }
+
+//     const isValidRelation = (r: any): boolean => {
+//       const aIsFact = cleanFacts.includes(r.tableA);
+//       const bIsFact = cleanFacts.includes(r.tableB);
+//       if (aIsFact || bIsFact) return true;
+
+//       const aLinked = dimensionsLinkedToFact.has(r.tableA);
+//       const bLinked = dimensionsLinkedToFact.has(r.tableB);
+//       if (aLinked && bLinked) {
+//         warnings.push(
+//           `Relation rejetée (${r.tableA} et ${r.tableB} sont toutes deux déjà reliées au fait — relation redondante/suspecte)`,
+//         );
+//         return false;
+//       }
+//       return true;
+//     };
+
+//     const confirmedRelations = parsed.confirmedRelations
+//     .filter(structurallyValid)
+//     .filter(isValidRelation)
+//     .map((r: any) => ({ ...r, reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) }));
+
+//     const additionalRelations = parsed.additionalRelations
+//     .filter(structurallyValid)
+//     .filter(isValidRelation)
+//     .map((r: any) => ({ ...r, reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) }));
+
+//      // --- Vérification de cohérence pour la constellation de faits ---
+//     if (cleanFacts.length > 1) {
+//       const dimensionsByFact = cleanFacts.map((fact) => {
+//         const linked = new Set(
+//           [...confirmedRelations, ...additionalRelations]
+//             .filter((r) => r.tableA === fact || r.tableB === fact)
+//             .map((r) => (r.tableA === fact ? r.tableB : r.tableA)),
+//         );
+//         return { fact, linked };
+//       });
+
+//       const allShared = dimensionsByFact.every((f, i) =>
+//         dimensionsByFact.some((other, j) => i !== j && [...f.linked].some((d) => other.linked.has(d))),
+//       );
+
+//       if (!allShared) {
+//         warnings.push('Constellation détectée mais aucune dimension partagée entre les faits — vérifier la cohérence');
+
+//         // Suggestion automatique : cherche une colonne commune entre les tables de faits
+//         const factMetas = cleanFacts.map((f) => metadata.find((m) => m[0]?.sourceTable === f));
+//         for (let i = 0; i < factMetas.length; i++) {
+//           for (let j = i + 1; j < factMetas.length; j++) {
+//             const commonCols = factMetas[i]
+//               ?.map((c) => c.columnName)
+//               .filter((col) => factMetas[j]?.some((c2) => c2.columnName === col));
+//             if (commonCols && commonCols.length > 0) {
+//               warnings.push(
+//                 `Suggestion : ${cleanFacts[i]} et ${cleanFacts[j]} partagent la colonne ${commonCols[0]} — envisager une dimension commune`,
+//               );
+//             }
+//           }
+//         }
+//       }
+//     }
+
+//    // --- Génération automatique et complète de DimTemps (jamais laissée à l'IA) ---
+//     // Cherche une colonne date pour CHAQUE fait, pas seulement le premier (cas constellation)
+//     const factsWithDate = cleanFacts
+//       .map((factName) => {
+//         const factMeta = metadata.find((table) => table[0]?.sourceTable === factName);
+//         const dateCol = factMeta?.find((col) => col.dataType.toLowerCase().includes('date'));
+//         return dateCol ? { factName, dateCol } : null;
+//       })
+//       .filter((x): x is { factName: string; dateCol: ColumnMetadata } => x !== null);
+
+//     let generatedDimensions: any[] = [];
+//     let factColumnTransformations: any[] = [];
+//     const finalConfirmedRelations = [...confirmedRelations];
+
+//     if (factsWithDate.length > 0 && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
+//       warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans au moins une table de faits)');
+//       cleanDimensions.push('DimTemps');
+//     }
+
+//     const dimTempsPresent = cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'));
+//     if (dimTempsPresent && factsWithDate.length > 0) {
+//       // La structure de DimTemps (colonnes) n'est créée qu'une seule fois, partagée par tous les faits
+//       const { generatedDimension } = this.buildDimTempsStructure(
+//         factsWithDate[0].factName,
+//         factsWithDate[0].dateCol.columnName,
+//       );
+//       generatedDimensions.push(generatedDimension);
+
+//       // Une relation distincte est générée pour CHAQUE fait ayant sa propre colonne date
+//       for (const { factName, dateCol } of factsWithDate) {
+//         const { factTransformation, relation } = this.buildDimTempsStructure(factName, dateCol.columnName);
+//         factColumnTransformations.push(factTransformation);
+//         finalConfirmedRelations.push(relation);
+//         warnings.push(
+//           `Structure DimTemps liée à ${factName} : ${dateCol.columnName} → ${factTransformation.newColumn} (FK vers DimTemps.DateKey)`,
+//         );
+//       }
+//     }
+
+//    // --- Validation des sous-dimensions proposées par l'IA ---
+//     const subDimensions = this.validateSubDimensions(
+//   (parsed as any).subDimensions,
+//   validColumnsByTable,
+//   cleanDimensions,
+//   warnings,
+//   validTableNames,
+// );
+
+//    const tableAttributes = this.buildTableAttributes(
+//   cleanDimensions,
+//   cleanFacts,
+//   metadata,
+//   generatedDimensions,
+//   subDimensions,
+// );
+
+// return {
+//   dimensions: cleanDimensions,
+//   facts: cleanFacts,
+//   confirmedRelations: finalConfirmedRelations,
+//   additionalRelations,
+//   generatedDimensions,
+//   factColumnTransformations,
+//   subDimensions,
+//   tableAttributes, // ← nouveau
+//   warnings,
+// };
+  
+//   }
+
+private validateAndClean(
+  parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[] },
+  validTableNames: Set<string>,
+  validColumnsByTable: Map<string, Set<string>>,
+  metadata: ColumnMetadata[][],
+): Omit<AiSchemaProposal, 'rawResponse'> {
+  const warnings: string[] = [];
+  const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
+
+  // ✅ CRÉER UNE VERSION NORMALISÉE DE validColumnsByTable (sans staging_)
+  const normalizedValidColumns = new Map<string, Set<string>>();
+  for (const [key, value] of validColumnsByTable.entries()) {
+    const normalizedKey = key.replace(/^staging_/i, '');
+    normalizedValidColumns.set(normalizedKey, value);
+    // Garder aussi la clé originale
+    normalizedValidColumns.set(key, value);
+  }
+
+  // --- 1. Normalisation des dimensions et faits ---
+  const isKnownOrDerived = (t: string, bucket: string): boolean => {
+    if (validTableNames.has(t)) return true;
+    if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
+      warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
       return true;
-    };
-
-    const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
-
-    const dimensionsLinkedToFact = new Set<string>();
-    for (const r of allRelationsRaw) {
-      if (cleanFacts.includes(r.tableA) && cleanDimensions.includes(r.tableB)) dimensionsLinkedToFact.add(r.tableB);
-      if (cleanFacts.includes(r.tableB) && cleanDimensions.includes(r.tableA)) dimensionsLinkedToFact.add(r.tableA);
     }
+    warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
+    return false;
+  };
 
-    const isValidRelation = (r: any): boolean => {
-      const aIsFact = cleanFacts.includes(r.tableA);
-      const bIsFact = cleanFacts.includes(r.tableB);
-      if (aIsFact || bIsFact) return true;
+  const normalizedDimensions = parsed.dimensions
+    .map((t) => this.normalizeTableEntry(t, validTableNames))
+    .filter((t): t is string => t !== null);
+  const normalizedFacts = parsed.facts
+    .map((t) => this.normalizeTableEntry(t, validTableNames))
+    .filter((t): t is string => t !== null);
 
-      const aLinked = dimensionsLinkedToFact.has(r.tableA);
-      const bLinked = dimensionsLinkedToFact.has(r.tableB);
-      if (aLinked && bLinked) {
-        warnings.push(
-          `Relation rejetée (${r.tableA} et ${r.tableB} sont toutes deux déjà reliées au fait — relation redondante/suspecte)`,
-        );
-        return false;
-      }
-      return true;
-    };
+  const dimensions = normalizedDimensions.filter((t) => isKnownOrDerived(t, 'dimensions'));
+  const facts = normalizedFacts.filter((t) => isKnownOrDerived(t, 'facts'));
 
-    const confirmedRelations = parsed.confirmedRelations
-    .filter(structurallyValid)
-    .filter(isValidRelation)
-    .map((r: any) => ({ ...r, reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) }));
+  const seen = new Set<string>();
+  const cleanFacts = facts.filter((t) => {
+    if (seen.has(t)) return false;
+    seen.add(t);
+    return true;
+  });
+  const cleanDimensions = dimensions.filter((t) => {
+    if (seen.has(t)) {
+      warnings.push(`Table ${t} classée à la fois en fait et dimension — gardée en fait uniquement`);
+      return false;
+    }
+    seen.add(t);
+    return true;
+  });
 
-    const additionalRelations = parsed.additionalRelations
-    .filter(structurallyValid)
-    .filter(isValidRelation)
-    .map((r: any) => ({ ...r, reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) }));
+  // Ajouter les tables non classées
+  for (const tableName of validTableNames) {
+    if (!seen.has(tableName)) {
+      warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
+      cleanDimensions.push(tableName);
+      seen.add(tableName);
+    }
+  }
 
-     // --- Vérification de cohérence pour la constellation de faits ---
-    if (cleanFacts.length > 1) {
-      const dimensionsByFact = cleanFacts.map((fact) => {
-        const linked = new Set(
-          [...confirmedRelations, ...additionalRelations]
-            .filter((r) => r.tableA === fact || r.tableB === fact)
-            .map((r) => (r.tableA === fact ? r.tableB : r.tableA)),
-        );
-        return { fact, linked };
-      });
+  // Fallback si aucun fait n'est identifié
+  if (cleanFacts.length === 0) {
+    const fallbackFact = this.detectLikelyFactTable(metadata);
+    if (fallbackFact && cleanDimensions.includes(fallbackFact)) {
+      warnings.push(`Aucun fait identifié par l'IA — ${fallbackFact} reclassée en fait par heuristique de secours`);
+      cleanDimensions.splice(cleanDimensions.indexOf(fallbackFact), 1);
+      cleanFacts.push(fallbackFact);
+    }
+  }
 
-      const allShared = dimensionsByFact.every((f, i) =>
-        dimensionsByFact.some((other, j) => i !== j && [...f.linked].some((d) => other.linked.has(d))),
+  // --- 2. Validation structurelle des relations (avec normalizedValidColumns) ---
+  const structurallyValid = (r: any): boolean => {
+    if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
+      warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
+      return false;
+    }
+    // Nettoyer les noms (enlever staging_)
+    r.tableA = r.tableA.replace(/^staging_/i, '');
+    r.tableB = r.tableB.replace(/^staging_/i, '');
+    
+    if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
+      warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
+      return false;
+    }
+    
+    // ✅ UTILISER normalizedValidColumns AU LIEU DE validColumnsByTable
+    const colsA = normalizedValidColumns.get(r.tableA);
+    if (!colsA || !colsA.has(r.columnA)) {
+      warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
+      return false;
+    }
+    const colsB = normalizedValidColumns.get(r.tableB);
+    if (!colsB || !colsB.has(r.columnB)) {
+      warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
+      return false;
+    }
+    return true;
+  };
+
+  // --- 3. Validation de la constellation ---
+  const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
+
+  const dimensionsLinkedToFact = new Set<string>();
+  for (const r of allRelationsRaw) {
+    if (cleanFacts.includes(r.tableA) && cleanDimensions.includes(r.tableB)) dimensionsLinkedToFact.add(r.tableB);
+    if (cleanFacts.includes(r.tableB) && cleanDimensions.includes(r.tableA)) dimensionsLinkedToFact.add(r.tableA);
+  }
+
+  const isValidRelation = (r: any): boolean => {
+    const aIsFact = cleanFacts.includes(r.tableA);
+    const bIsFact = cleanFacts.includes(r.tableB);
+    if (aIsFact || bIsFact) return true;
+
+    const aLinked = dimensionsLinkedToFact.has(r.tableA);
+    const bLinked = dimensionsLinkedToFact.has(r.tableB);
+    if (aLinked && bLinked) {
+      warnings.push(
+        `Relation rejetée (${r.tableA} et ${r.tableB} sont toutes deux déjà reliées au fait — relation redondante/suspecte)`,
       );
+      return false;
+    }
+    return true;
+  };
 
-      if (!allShared) {
-        warnings.push('Constellation détectée mais aucune dimension partagée entre les faits — vérifier la cohérence');
+  // --- 4. Construire les relations confirmées ---
+  let confirmedRelations = parsed.confirmedRelations
+    .filter(structurallyValid)
+    .filter(isValidRelation)
+    .map((r: any) => ({ 
+      ...r, 
+      reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) 
+    }));
 
-        // Suggestion automatique : cherche une colonne commune entre les tables de faits
-        const factMetas = cleanFacts.map((f) => metadata.find((m) => m[0]?.sourceTable === f));
-        for (let i = 0; i < factMetas.length; i++) {
-          for (let j = i + 1; j < factMetas.length; j++) {
-            const commonCols = factMetas[i]
-              ?.map((c) => c.columnName)
-              .filter((col) => factMetas[j]?.some((c2) => c2.columnName === col));
-            if (commonCols && commonCols.length > 0) {
-              warnings.push(
-                `Suggestion : ${cleanFacts[i]} et ${cleanFacts[j]} partagent la colonne ${commonCols[0]} — envisager une dimension commune`,
-              );
-            }
+  let additionalRelations = parsed.additionalRelations
+    .filter(structurallyValid)
+    .filter(isValidRelation)
+    .map((r: any) => ({ 
+      ...r, 
+      reason: this.computeActualReason(r.tableA, r.columnA, r.tableB, r.columnB) 
+    }));
+
+  // --- 5. Validation des sous-dimensions ---
+  const subDimensions = this.validateSubDimensions(
+    (parsed as any).subDimensions,
+    validColumnsByTable,
+    cleanDimensions,
+    warnings,
+    validTableNames,
+  );
+
+  // --- 6. Filtrer les relations vers les sous-dimensions ---
+  const subDimensionNames = new Set(subDimensions.map(sd => sd.name));
+
+  confirmedRelations = confirmedRelations.filter((r: any) => 
+    !subDimensionNames.has(r.tableA) && !subDimensionNames.has(r.tableB)
+  );
+
+  additionalRelations = additionalRelations.filter((r: any) => 
+    !subDimensionNames.has(r.tableA) && !subDimensionNames.has(r.tableB)
+  );
+
+  // --- 7. Vérification de cohérence pour la constellation de faits ---
+  if (cleanFacts.length > 1) {
+    const dimensionsByFact = cleanFacts.map((fact) => {
+      const linked = new Set(
+        [...confirmedRelations, ...additionalRelations]
+          .filter((r) => r.tableA === fact || r.tableB === fact)
+          .map((r) => (r.tableA === fact ? r.tableB : r.tableA)),
+      );
+      return { fact, linked };
+    });
+
+    const allShared = dimensionsByFact.every((f, i) =>
+      dimensionsByFact.some((other, j) => i !== j && [...f.linked].some((d) => other.linked.has(d))),
+    );
+
+    if (!allShared) {
+      warnings.push('Constellation détectée mais aucune dimension partagée entre les faits — vérifier la cohérence');
+
+      const factMetas = cleanFacts.map((f) => metadata.find((m) => m[0]?.sourceTable === f));
+      for (let i = 0; i < factMetas.length; i++) {
+        for (let j = i + 1; j < factMetas.length; j++) {
+          const commonCols = factMetas[i]
+            ?.map((c) => c.columnName)
+            .filter((col) => factMetas[j]?.some((c2) => c2.columnName === col));
+          if (commonCols && commonCols.length > 0) {
+            warnings.push(
+              `Suggestion : ${cleanFacts[i]} et ${cleanFacts[j]} partagent la colonne ${commonCols[0]} — envisager une dimension commune`,
+            );
           }
         }
       }
     }
-
-   // --- Génération automatique et complète de DimTemps (jamais laissée à l'IA) ---
-    // Cherche une colonne date pour CHAQUE fait, pas seulement le premier (cas constellation)
-    const factsWithDate = cleanFacts
-      .map((factName) => {
-        const factMeta = metadata.find((table) => table[0]?.sourceTable === factName);
-        const dateCol = factMeta?.find((col) => col.dataType.toLowerCase().includes('date'));
-        return dateCol ? { factName, dateCol } : null;
-      })
-      .filter((x): x is { factName: string; dateCol: ColumnMetadata } => x !== null);
-
-    let generatedDimensions: any[] = [];
-    let factColumnTransformations: any[] = [];
-    const finalConfirmedRelations = [...confirmedRelations];
-
-    if (factsWithDate.length > 0 && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
-      warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans au moins une table de faits)');
-      cleanDimensions.push('DimTemps');
-    }
-
-    const dimTempsPresent = cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'));
-    if (dimTempsPresent && factsWithDate.length > 0) {
-      // La structure de DimTemps (colonnes) n'est créée qu'une seule fois, partagée par tous les faits
-      const { generatedDimension } = this.buildDimTempsStructure(
-        factsWithDate[0].factName,
-        factsWithDate[0].dateCol.columnName,
-      );
-      generatedDimensions.push(generatedDimension);
-
-      // Une relation distincte est générée pour CHAQUE fait ayant sa propre colonne date
-      for (const { factName, dateCol } of factsWithDate) {
-        const { factTransformation, relation } = this.buildDimTempsStructure(factName, dateCol.columnName);
-        factColumnTransformations.push(factTransformation);
-        finalConfirmedRelations.push(relation);
-        warnings.push(
-          `Structure DimTemps liée à ${factName} : ${dateCol.columnName} → ${factTransformation.newColumn} (FK vers DimTemps.DateKey)`,
-        );
-      }
-    }
-
-   // --- Validation des sous-dimensions proposées par l'IA ---
-    const subDimensions = this.validateSubDimensions(
-  (parsed as any).subDimensions,
-  validColumnsByTable,
-  cleanDimensions,
-  warnings,
-  validTableNames,
-);
-
-   const tableAttributes = this.buildTableAttributes(
-  cleanDimensions,
-  cleanFacts,
-  metadata,
-  generatedDimensions,
-  subDimensions,
-);
-
-return {
-  dimensions: cleanDimensions,
-  facts: cleanFacts,
-  confirmedRelations: finalConfirmedRelations,
-  additionalRelations,
-  generatedDimensions,
-  factColumnTransformations,
-  subDimensions,
-  tableAttributes, // ← nouveau
-  warnings,
-};
-  
   }
 
+  // --- 8. Génération automatique de DimTemps ---
+  const factsWithDate = cleanFacts
+    .map((factName) => {
+      const factMeta = metadata.find((table) => table[0]?.sourceTable === factName);
+      const dateCol = factMeta?.find((col) => col.dataType.toLowerCase().includes('date'));
+      return dateCol ? { factName, dateCol } : null;
+    })
+    .filter((x): x is { factName: string; dateCol: ColumnMetadata } => x !== null);
+
+  let generatedDimensions: any[] = [];
+  let factColumnTransformations: any[] = [];
+  const finalConfirmedRelations = [...confirmedRelations];
+
+  if (factsWithDate.length > 0 && !cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'))) {
+    warnings.push('DimTemps ajoutée automatiquement (colonne date détectée dans au moins une table de faits)');
+    cleanDimensions.push('DimTemps');
+  }
+
+  const dimTempsPresent = cleanDimensions.some((d) => d.toLowerCase().includes('dimtemps'));
+  if (dimTempsPresent && factsWithDate.length > 0) {
+    const { generatedDimension } = this.buildDimTempsStructure(
+      factsWithDate[0].factName,
+      factsWithDate[0].dateCol.columnName,
+    );
+    generatedDimensions.push(generatedDimension);
+
+    for (const { factName, dateCol } of factsWithDate) {
+      const { factTransformation, relation } = this.buildDimTempsStructure(factName, dateCol.columnName);
+      factColumnTransformations.push(factTransformation);
+      finalConfirmedRelations.push(relation);
+      warnings.push(
+        `Structure DimTemps liée à ${factName} : ${dateCol.columnName} → ${factTransformation.newColumn} (FK vers DimTemps.DateKey)`,
+      );
+    }
+  }
+
+  // --- 9. Construction des attributs des tables ---
+  const tableAttributes = this.buildTableAttributes(
+    cleanDimensions,
+    cleanFacts,
+    metadata,
+    generatedDimensions,
+    subDimensions,
+  );
+
+  // --- 10. Retourner le résultat ---
+  return {
+    dimensions: cleanDimensions,
+    facts: cleanFacts,
+    confirmedRelations: finalConfirmedRelations,
+    additionalRelations,
+    generatedDimensions,
+    factColumnTransformations,
+    subDimensions,
+    tableAttributes,
+    warnings,
+  };
+}
 
 private buildChatPrompt(currentSchema: any, userMessage: string): string {
   return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
