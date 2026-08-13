@@ -14,6 +14,7 @@ export interface ColumnMetadata {
   sampleValues: string[];
   isLikelyKey: boolean;
   isSensitive: boolean;
+  rowCount?: number; // ← OK
   min?: string | number;
   max?: string | number;
   detectedPattern?: string;
