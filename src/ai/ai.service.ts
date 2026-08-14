@@ -35,6 +35,10 @@ export class AiService {
   return tableName.replace(/^staging_/i, '');
 }
 
+private stripPrefix(t: string): string {
+  return t.replace(/^staging_/i, '');
+}
+
 // ✅ 1. D'abord les méthodes utilitaires (avant validateAndClean)
   private isLegitimateDerivedDimension(tableName: unknown, hasDateColumn: boolean): boolean {
     if (typeof tableName !== 'string') return false;
@@ -1428,21 +1432,18 @@ private async detectSubDimensions(metadata: ColumnMetadata[][]): Promise<any[]> 
 //   };
 // }
 private validateAndClean(
-  parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[];subDimensions?: unknown[]; },
+  parsed: { dimensions: unknown[]; facts: unknown[]; confirmedRelations: any[]; additionalRelations: any[]; subDimensions?: unknown[]; },
   validTableNames: Set<string>,
   validColumnsByTable: Map<string, Set<string>>,
   metadata: ColumnMetadata[][],
-  
 ): Omit<AiSchemaProposal, 'rawResponse'> {
   const warnings: string[] = [];
   const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
 
-  // ✅ CRÉER UNE VERSION NORMALISÉE DE validColumnsByTable (sans staging_)
   const normalizedValidColumns = new Map<string, Set<string>>();
   for (const [key, value] of validColumnsByTable.entries()) {
-    const normalizedKey = key.replace(/^staging_/i, '');
+    const normalizedKey = this.stripPrefix(key);
     normalizedValidColumns.set(normalizedKey, value);
-    // Garder aussi la clé originale
     normalizedValidColumns.set(key, value);
   }
 
@@ -1482,7 +1483,6 @@ private validateAndClean(
     return true;
   });
 
-  // Ajouter les tables non classées
   for (const tableName of validTableNames) {
     if (!seen.has(tableName)) {
       warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
@@ -1491,33 +1491,29 @@ private validateAndClean(
     }
   }
 
-  // Fallback si aucun fait n'est identifié
-    // Fallback élargi : récupère toutes les tables à fort profil "fait" mal classées en dimension
-const likelyFacts = this.detectLikelyFactTables(metadata);
-for (const candidate of likelyFacts) {
-  if (cleanDimensions.includes(candidate) && !cleanFacts.includes(candidate)) {
-    warnings.push(`${candidate} reclassée en fait par heuristique de secours (profil fort: clés étrangères + mesures)`);
-    cleanDimensions.splice(cleanDimensions.indexOf(candidate), 1);
-    cleanFacts.push(candidate);
+  const likelyFacts = this.detectLikelyFactTables(metadata);
+  for (const candidate of likelyFacts) {
+    if (cleanDimensions.includes(candidate) && !cleanFacts.includes(candidate)) {
+      warnings.push(`${candidate} reclassée en fait par heuristique de secours (profil fort: clés étrangères + mesures)`);
+      cleanDimensions.splice(cleanDimensions.indexOf(candidate), 1);
+      cleanFacts.push(candidate);
+    }
   }
-}
-  
-  // --- 2. Validation structurelle des relations (avec normalizedValidColumns) ---
+
+  // --- 2. Validation structurelle des relations ---
   const structurallyValid = (r: any): boolean => {
     if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
       warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
       return false;
     }
-    // Nettoyer les noms (enlever staging_)
-    r.tableA = r.tableA.replace(/^staging_/i, '');
-    r.tableB = r.tableB.replace(/^staging_/i, '');
-    
+    r.tableA = this.stripPrefix(r.tableA);
+    r.tableB = this.stripPrefix(r.tableB);
+
     if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
       warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
       return false;
     }
-    
-    // ✅ UTILISER normalizedValidColumns AU LIEU DE validColumnsByTable
+
     const colsA = normalizedValidColumns.get(r.tableA);
     if (!colsA || !colsA.has(r.columnA)) {
       warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
@@ -1534,19 +1530,26 @@ for (const candidate of likelyFacts) {
   // --- 3. Validation de la constellation ---
   const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
 
+  const cleanFactsStripped = new Set(cleanFacts.map((t) => this.stripPrefix(t)));
+  const cleanDimensionsStripped = new Set(cleanDimensions.map((t) => this.stripPrefix(t)));
+
   const dimensionsLinkedToFact = new Set<string>();
   for (const r of allRelationsRaw) {
-    if (cleanFacts.includes(r.tableA) && cleanDimensions.includes(r.tableB)) dimensionsLinkedToFact.add(r.tableB);
-    if (cleanFacts.includes(r.tableB) && cleanDimensions.includes(r.tableA)) dimensionsLinkedToFact.add(r.tableA);
+    const a = this.stripPrefix(r.tableA);
+    const b = this.stripPrefix(r.tableB);
+    if (cleanFactsStripped.has(a) && cleanDimensionsStripped.has(b)) dimensionsLinkedToFact.add(b);
+    if (cleanFactsStripped.has(b) && cleanDimensionsStripped.has(a)) dimensionsLinkedToFact.add(a);
   }
 
   const isValidRelation = (r: any): boolean => {
-    const aIsFact = cleanFacts.includes(r.tableA);
-    const bIsFact = cleanFacts.includes(r.tableB);
+    const a = this.stripPrefix(r.tableA);
+    const b = this.stripPrefix(r.tableB);
+    const aIsFact = cleanFactsStripped.has(a);
+    const bIsFact = cleanFactsStripped.has(b);
     if (aIsFact || bIsFact) return true;
 
-    const aLinked = dimensionsLinkedToFact.has(r.tableA);
-    const bLinked = dimensionsLinkedToFact.has(r.tableB);
+    const aLinked = dimensionsLinkedToFact.has(a);
+    const bLinked = dimensionsLinkedToFact.has(b);
     if (aLinked && bLinked) {
       warnings.push(
         `Relation rejetée (${r.tableA} et ${r.tableB} sont toutes deux déjà reliées au fait — relation redondante/suspecte)`,
@@ -1557,22 +1560,20 @@ for (const candidate of likelyFacts) {
   };
 
   // --- 4. Construire les relations confirmées ---
- // Dans validateAndClean, la partie 4 devient :
-// --- 4. Construire les relations confirmées ---
-// Les relations sont déjà reconstruites depuis les indexes, on les garde telles quelles
-let confirmedRelations = parsed.confirmedRelations
-  .filter((r: any) => r && r.tableA && r.columnA && r.tableB && r.columnB)
-  .filter(isValidRelation)  // ← remettre ce filtre
-  .map((r: any) => ({...r, reason: r.reason || 'relation_confirmee_par_ia'}));
+  // ✅ FIX : .filter(structurallyValid) était manquant ici, causait le doublon DimTemps
+  let confirmedRelations = parsed.confirmedRelations
+    .filter(structurallyValid)
+    .filter(isValidRelation)
+    .map((r: any) => ({ ...r, reason: r.reason || 'relation_confirmee_par_ia' }));
 
-let additionalRelations = parsed.additionalRelations
-  .filter((r: any) => r && r.tableA && r.columnA && r.tableB && r.columnB)
-  .filter(isValidRelation)  // ← idem
-  .map((r: any) => ({...r, reason: r.reason || 'relation_additionnelle'}));
+  let additionalRelations = parsed.additionalRelations
+    .filter(structurallyValid)
+    .filter(isValidRelation)
+    .map((r: any) => ({ ...r, reason: r.reason || 'relation_additionnelle' }));
+
   // --- 5. Validation des sous-dimensions ---
-  // Calculer la liste des candidats valides
   const candidateSet = this.getSubDimensionCandidateSet(metadata);
-  
+
   const subDimensions = this.validateSubDimensions(
     (parsed as any).subDimensions,
     validColumnsByTable,
@@ -1583,14 +1584,13 @@ let additionalRelations = parsed.additionalRelations
   );
 
   // --- 6. Filtrer les relations vers les sous-dimensions ---
-  const subDimensionNames = new Set(subDimensions.map(sd => sd.name));
+  const subDimensionNames = new Set(subDimensions.map((sd) => sd.name));
 
-  confirmedRelations = confirmedRelations.filter((r: any) => 
-    !subDimensionNames.has(r.tableA) && !subDimensionNames.has(r.tableB)
+  confirmedRelations = confirmedRelations.filter(
+    (r: any) => !subDimensionNames.has(r.tableA) && !subDimensionNames.has(r.tableB),
   );
-
-  additionalRelations = additionalRelations.filter((r: any) => 
-    !subDimensionNames.has(r.tableA) && !subDimensionNames.has(r.tableB)
+  additionalRelations = additionalRelations.filter(
+    (r: any) => !subDimensionNames.has(r.tableA) && !subDimensionNames.has(r.tableB),
   );
 
   // --- 7. Vérification de cohérence pour la constellation de faits ---
@@ -1663,53 +1663,47 @@ let additionalRelations = parsed.additionalRelations
     }
   }
 
-  // --- 9. 🔥 FALLBACK : Si aucune relation n'a été proposée par l'IA ---
+  // --- 9. Fallback : si aucune relation n'a été proposée par l'IA ---
   if (finalConfirmedRelations.length === 0 && additionalRelations.length === 0) {
-    warnings.push('Aucune relation proposée par l\'IA - utilisation des relations pré-détectées par heuristique');
-    
-    // Utiliser les relations pré-détectées par l'heuristique
+    warnings.push("Aucune relation proposée par l'IA - utilisation des relations pré-détectées par heuristique");
+
     const preFilterRelations = this.uploadService.detectCrossTableRelations(metadata);
     let fallbackCount = 0;
-    
+
     for (const rel of preFilterRelations) {
-      // Nettoyer les noms (enlever staging_)
-      const tableA = rel.tableA.replace(/^staging_/i, '');
-      const tableB = rel.tableB.replace(/^staging_/i, '');
-      
-      // Vérifier que les tables existent dans les dimensions ou faits
+      const tableA = this.stripPrefix(rel.tableA);
+      const tableB = this.stripPrefix(rel.tableB);
+
       const aExists = cleanDimensions.includes(tableA) || cleanFacts.includes(tableA);
       const bExists = cleanDimensions.includes(tableB) || cleanFacts.includes(tableB);
-      
+
       if (aExists && bExists) {
-        // Vérifier que les colonnes existent
         const colsA = normalizedValidColumns.get(tableA);
         const colsB = normalizedValidColumns.get(tableB);
-        
+
         if (colsA?.has(rel.columnA) && colsB?.has(rel.columnB)) {
-          // Éviter les doublons
-          const isDuplicate = finalConfirmedRelations.some((r: any) => 
-            r.tableA === tableA && r.columnA === rel.columnA && 
-            r.tableB === tableB && r.columnB === rel.columnB
+          const isDuplicate = finalConfirmedRelations.some(
+            (r: any) => r.tableA === tableA && r.columnA === rel.columnA && r.tableB === tableB && r.columnB === rel.columnB,
           );
-          
+
           if (!isDuplicate) {
             finalConfirmedRelations.push({
               tableA,
               columnA: rel.columnA,
               tableB,
               columnB: rel.columnB,
-              reason: 'relation_pre_detectee_par_heuristique'
+              reason: 'relation_pre_detectee_par_heuristique',
             });
             fallbackCount++;
           }
         }
       }
     }
-    
+
     if (fallbackCount > 0) {
       warnings.push(`${fallbackCount} relations récupérées via le fallback heuristique`);
     } else {
-      warnings.push('Aucune relation n\'a pu être récupérée via le fallback');
+      warnings.push("Aucune relation n'a pu être récupérée via le fallback");
     }
   }
 
@@ -1744,18 +1738,19 @@ ${JSON.stringify({ dimensions: currentSchema.dimensions, facts: currentSchema.fa
 
 Message de l'utilisateur : "${userMessage}"
 
-Réponds à sa question ou sa demande de façon naturelle et utile, en français. Si sa demande implique une modification claire du schéma (déplacer une table, ajouter/retirer une relation), applique-la, en respectant ces règles :
-- INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
-- Le schéma peut avoir PLUSIEURS tables de faits (constellation) si l'utilisateur le demande — dans ce cas, veille à ce qu'au moins une dimension reste reliée aux différentes tables de faits.
-- N'invente jamais de nom de table ou de colonne qui n'existe pas déjà dans le schéma actuel ou les métadonnées d'origine.
-- Ne modifie jamais "DimTemps" ni ses relations — cette dimension est gérée automatiquement, ignore toute demande à son sujet et explique-le à l'utilisateur si besoin.
+Réponds à sa question ou sa demande de façon naturelle et utile, en français.
 
-Sinon, réponds simplement sans modifier le schéma.
+⚠️ IMPORTANT : détermine d'abord si le message est une SIMPLE QUESTION (ne demande aucune modification, juste une explication) ou une DEMANDE DE MODIFICATION explicite (déplacer une table, ajouter/retirer une relation).
+
+- Si c'est une SIMPLE QUESTION : mets "schemaChanged": false, et NE RENVOIE PAS les champs "dimensions"/"facts"/"confirmedRelations" (laisse-les absents ou vides).
+- Si c'est une DEMANDE DE MODIFICATION : applique-la en respectant ces règles, mets "schemaChanged": true, et renvoie les champs complets et mis à jour :
+  - INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
+  - Le schéma peut avoir PLUSIEURS tables de faits (constellation) si l'utilisateur le demande — dans ce cas, veille à ce qu'au moins une dimension reste reliée aux différentes tables de faits.
+  - N'invente jamais de nom de table ou de colonne qui n'existe pas déjà dans le schéma actuel ou les métadonnées d'origine.
+  - Ne modifie jamais "DimTemps" ni ses relations — cette dimension est gérée automatiquement, ignore toute demande à son sujet et explique-le à l'utilisateur si besoin.
 
 Réponds STRICTEMENT en JSON avec ce format :
-{"reply":"ta réponse conversationnelle à l'utilisateur","dimensions":["..."],"facts":["..."],"confirmedRelations":[...]}
-
-Les champs "dimensions", "facts", "confirmedRelations" doivent TOUJOURS être présents et refléter le schéma actuel — inchangé si aucune modification n'était demandée, modifié sinon.`;
+{"reply":"ta réponse conversationnelle à l'utilisateur","schemaChanged":false,"dimensions":[],"facts":[],"confirmedRelations":[]}`;
 }
 
   private computeDiffExplanation(oldSchema: any, newSchema: any): string {
@@ -1809,7 +1804,6 @@ async applyChatModification(
     validColumnsByTable.set(cols[0].sourceTable, new Set(cols.map((c) => c.columnName)));
   }
 
-  // Remet les noms internes AVANT tout traitement, pour rester cohérent avec validColumnsByTable
   const internalCurrentSchema = this.restoreInternalNames(currentSchema, validTableNames);
 
   const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage);
@@ -1821,18 +1815,40 @@ async applyChatModification(
       const cleaned = rawResponse.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(cleaned);
 
+      // ✅ Que le schéma ait changé ou non, on repasse TOUJOURS par validateAndClean
+      // pour bénéficier du nettoyage (dédoublonnage DimTemps, etc.) — mais on utilise
+      // le schéma ACTUEL comme source si le modèle indique qu'il n'y a rien à changer
+      const sourceForValidation = parsed.schemaChanged === false
+        ? internalCurrentSchema
+        : {
+            dimensions: parsed.dimensions ?? internalCurrentSchema.dimensions,
+            facts: parsed.facts ?? internalCurrentSchema.facts,
+            confirmedRelations: parsed.confirmedRelations ?? internalCurrentSchema.confirmedRelations,
+          };
+
       const validated = this.validateAndClean(
         {
-          dimensions: parsed.dimensions ?? internalCurrentSchema.dimensions,
-          facts: parsed.facts ?? internalCurrentSchema.facts,
-          confirmedRelations: parsed.confirmedRelations ?? internalCurrentSchema.confirmedRelations,
+          dimensions: sourceForValidation.dimensions,
+          facts: sourceForValidation.facts,
+          confirmedRelations: sourceForValidation.confirmedRelations,
           additionalRelations: [],
-          subDimensions: parsed.subDimensions ?? [],
+          subDimensions: internalCurrentSchema.subDimensions ?? [],
         } as any,
         validTableNames,
         validColumnsByTable,
         metadata,
       );
+
+      const displayed = this.applyDisplayNames(validated);
+
+      if (parsed.schemaChanged === false) {
+        // Pas de vraie modification demandée : on renvoie la version nettoyée,
+        // sans mention de "changement appliqué" même si le nettoyage a retiré des doublons
+        return {
+          updatedSchema: { ...displayed, rawResponse },
+          explanation: parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?",
+        };
+      }
 
       const diffText = this.computeDiffExplanation(internalCurrentSchema, validated);
       const hasRealChange = diffText !== 'Aucun changement détecté dans le schéma';
@@ -1840,8 +1856,6 @@ async applyChatModification(
       const finalReply = hasRealChange
         ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
         : parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?";
-
-      const displayed = this.applyDisplayNames(validated);
 
       return {
         updatedSchema: { ...displayed, rawResponse },
