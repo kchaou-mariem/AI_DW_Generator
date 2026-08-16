@@ -1,0 +1,88 @@
+<div class="container py-4">
+  <h1 class="mb-4">Upload de fichiers — Génération de Data Warehouse</h1>
+
+  <div class="alert alert-danger" *ngIf="errorMessage">{{ errorMessage }}</div>
+
+  <div class="card mb-4">
+    <div class="card-body">
+      <h5 class="card-title">1. Base de données de staging</h5>
+
+      <div class="mb-3" *ngIf="!creatingNewDatabase">
+        <label class="form-label">Base existante</label>
+        <select class="form-select" [(ngModel)]="selectedDatabase">
+          <option value="" disabled>-- Choisir une base --</option>
+          <option *ngFor="let db of databases" [value]="db">{{ db }}</option>
+        </select>
+        <button type="button" class="btn btn-link mt-2 p-0" (click)="creatingNewDatabase = true">
+          + Créer une nouvelle base
+        </button>
+      </div>
+
+      <div class="mb-3" *ngIf="creatingNewDatabase">
+        <label class="form-label">Nom de la nouvelle base</label>
+        <div class="input-group">
+          <input type="text" class="form-control" [(ngModel)]="newDatabaseName" placeholder="ex: stagingDB" />
+          <button type="button" class="btn btn-primary" (click)="createDatabase()">Créer</button>
+          <button type="button" class="btn btn-outline-secondary" (click)="creatingNewDatabase = false">Annuler</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card mb-4">
+    <div class="card-body">
+      <h5 class="card-title">2. Fichiers à uploader</h5>
+
+      <div class="d-flex align-items-center gap-2 mb-3">
+        <label class="btn btn-outline-primary mb-0">
+          + Ajouter des fichiers
+          <input type="file" multiple hidden (change)="onFileSelected($event)" />
+        </label>
+      </div>
+
+      <ul class="list-group" *ngIf="selectedFiles.length > 0">
+        <li
+          class="list-group-item d-flex justify-content-between align-items-center"
+          *ngFor="let file of selectedFiles; let i = index"
+        >
+          {{ file.name }}
+          <button type="button" class="btn btn-sm btn-outline-danger" (click)="removeFile(i)">✕</button>
+        </li>
+      </ul>
+
+      <div class="mt-2" *ngIf="selectedFiles.length === 0">
+        <small class="text-muted">Aucun fichier sélectionné.</small>
+      </div>
+    </div>
+  </div>
+
+  <button
+    type="button"
+    class="btn btn-success"
+    [disabled]="isUploading || !selectedDatabase || selectedFiles.length === 0"
+    (click)="submitUpload()"
+  >
+    <span *ngIf="isUploading" class="spinner-border spinner-border-sm me-2"></span>
+    {{ isUploading ? 'Upload en cours...' : 'Uploader' }}
+  </button>
+
+  <div class="card mt-4" *ngIf="uploadResult">
+    <div class="card-body">
+      <h5 class="card-title text-success">✓ Upload terminé</h5>
+      <ul class="list-group list-group-flush">
+        <li class="list-group-item" *ngFor="let file of uploadResult.files">
+          <strong>{{ file.fileName }}</strong>
+          <span *ngIf="file.success" class="text-success"> — {{ file.rowCount }} lignes importées</span>
+          <span *ngIf="!file.success" class="text-danger"> — Erreur : {{ file.error }}</span>
+        </li>
+      </ul>
+
+      <button type="button" class="btn btn-primary mt-3" *ngIf="hasValidUploadedFile" (click)="goToSchemaGeneration()">
+        Générer le schéma IA →
+      </button>
+      <div class="alert alert-warning mt-3" *ngIf="!hasValidUploadedFile">
+        Aucun fichier valide n'a pu être importé. Corrige les fichiers en erreur et réessaie.
+      </div>
+    </div>
+  </div>
+</div>
