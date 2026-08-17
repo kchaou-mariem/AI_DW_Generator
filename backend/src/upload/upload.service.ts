@@ -47,12 +47,14 @@ export class UploadService {
 }
 
   private async getMasterPool(): Promise<sql.ConnectionPool> {
-    return sql.connect({ ...this.getBaseConfig(), database: 'master' });
-  }
+  const pool = new sql.ConnectionPool({ ...this.getBaseConfig(), database: 'master' });
+  return pool.connect();
+}
 
-  private async getPool(database: string): Promise<sql.ConnectionPool> {
-    return sql.connect({ ...this.getBaseConfig(), database });
-  }
+private async getPool(database: string): Promise<sql.ConnectionPool> {
+  const pool = new sql.ConnectionPool({ ...this.getBaseConfig(), database });
+  return pool.connect();
+}
 
   // ---- Gestion des bases ----
   async listDatabases(): Promise<string[]> {
@@ -69,20 +71,38 @@ export class UploadService {
     }
   }
 
+  // async ensureDatabaseExists(database: string): Promise<{ created: boolean }> {
+  //   if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+  //     throw new BadRequestException('Nom de base de données invalide (lettres, chiffres, underscore uniquement)');
+  //   }
+  //   const pool = await this.getMasterPool();
+  //   try {
+  //     const check = await pool.request().query(`SELECT name FROM sys.databases WHERE name = '${database}'`);
+  //     if (check.recordset.length > 0) return { created: false };
+  //     await pool.request().query(`CREATE DATABASE [${database}]`);
+  //     return { created: true };
+  //   } finally {
+  //     await pool.close();
+  //   }
+  // }
   async ensureDatabaseExists(database: string): Promise<{ created: boolean }> {
-    if (!/^[a-zA-Z0-9_]+$/.test(database)) {
+  const trimmed = database.trim();
+  const pool = await this.getMasterPool();
+  try {
+    const check = await pool.request()
+      .input('dbName', sql.NVarChar, trimmed)
+      .query(`SELECT name FROM sys.databases WHERE name = @dbName`);
+    if (check.recordset.length > 0) return { created: false };
+
+    if (!/^[a-zA-Z0-9_]+$/.test(trimmed)) {
       throw new BadRequestException('Nom de base de données invalide (lettres, chiffres, underscore uniquement)');
     }
-    const pool = await this.getMasterPool();
-    try {
-      const check = await pool.request().query(`SELECT name FROM sys.databases WHERE name = '${database}'`);
-      if (check.recordset.length > 0) return { created: false };
-      await pool.request().query(`CREATE DATABASE [${database}]`);
-      return { created: true };
-    } finally {
-      await pool.close();
-    }
+    await pool.request().query(`CREATE DATABASE [${trimmed}]`);
+    return { created: true };
+  } finally {
+    await pool.close();
   }
+}
 
   // ---- Traitement d'un fichier, dans une base précise ----
   async processFile(file: Express.Multer.File, database: string) {

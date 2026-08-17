@@ -9,7 +9,7 @@
 
       <div class="mb-3" *ngIf="!creatingNewDatabase">
         <label class="form-label">Base existante</label>
-        <select class="form-select" [(ngModel)]="selectedDatabase">
+        <select class="form-select" [(ngModel)]="selectedDatabase" (change)="onDatabaseSelected()">
           <option value="" disabled>-- Choisir une base --</option>
           <option *ngFor="let db of databases" [value]="db">{{ db }}</option>
         </select>
@@ -26,10 +26,39 @@
           <button type="button" class="btn btn-outline-secondary" (click)="creatingNewDatabase = false">Annuler</button>
         </div>
       </div>
+
+      <!-- Nouveau : statut de la base sélectionnée -->
+      <div *ngIf="selectedDatabase && !creatingNewDatabase">
+        <div class="text-muted small" *ngIf="checkingStatus">
+          <span class="spinner-border spinner-border-sm me-1"></span> Vérification de la base...
+        </div>
+
+        <div class="d-flex flex-wrap gap-2 mt-2" *ngIf="!checkingStatus && databaseStatus">
+          <button
+            type="button"
+            class="btn btn-outline-primary btn-sm"
+            *ngIf="databaseStatus.hasValidatedSchema"
+            (click)="viewValidatedSchema()"
+          >
+            📄 Voir le dernier schéma validé
+          </button>
+          <button
+            type="button"
+            class="btn btn-outline-success btn-sm"
+            *ngIf="databaseStatus.hasStagingTables"
+            (click)="generateAiSchema()"
+          >
+            ✨ Générer le schéma IA
+          </button>
+          <button type="button" class="btn btn-outline-secondary btn-sm" (click)="toggleUploadSection()">
+            📤 {{ showUploadSection ? 'Masquer l\'upload' : 'Uploader de nouveaux fichiers' }}
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 
-  <div class="card mb-4">
+  <div class="card mb-4" *ngIf="showUploadSection">
     <div class="card-body">
       <h5 class="card-title">2. Fichiers à uploader</h5>
 
@@ -53,18 +82,18 @@
       <div class="mt-2" *ngIf="selectedFiles.length === 0">
         <small class="text-muted">Aucun fichier sélectionné.</small>
       </div>
+
+      <button
+        type="button"
+        class="btn btn-success mt-3"
+        [disabled]="isUploading || !selectedDatabase || selectedFiles.length === 0"
+        (click)="submitUpload()"
+      >
+        <span *ngIf="isUploading" class="spinner-border spinner-border-sm me-2"></span>
+        {{ isUploading ? 'Upload en cours...' : 'Uploader' }}
+      </button>
     </div>
   </div>
-
-  <button
-    type="button"
-    class="btn btn-success"
-    [disabled]="isUploading || !selectedDatabase || selectedFiles.length === 0"
-    (click)="submitUpload()"
-  >
-    <span *ngIf="isUploading" class="spinner-border spinner-border-sm me-2"></span>
-    {{ isUploading ? 'Upload en cours...' : 'Uploader' }}
-  </button>
 
   <div class="card mt-4" *ngIf="uploadResult">
     <div class="card-body">

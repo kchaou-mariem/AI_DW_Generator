@@ -350,7 +350,7 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
 // {"dimensions":["..."],"facts":["..."],"confirmedRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"..."}],"additionalRelations":[{"tableA":"...","columnA":"...","tableB":"...","columnB":"..."}],"subDimensions":[]}`;
 // }
 private metadataCache = new Map<string, { data: ColumnMetadata[][]; timestamp: number }>();
-private readonly CACHE_TTL = 60000; // 1 minute
+private readonly CACHE_TTL = 600000; // 1 minute
 
 async getMetadataWithCache(database: string): Promise<ColumnMetadata[][]> {
   const cached = this.metadataCache.get(database);
@@ -1750,45 +1750,58 @@ Réponds à sa question ou sa demande de façon naturelle et utile, en français
   - Ne modifie jamais "DimTemps" ni ses relations — cette dimension est gérée automatiquement, ignore toute demande à son sujet et explique-le à l'utilisateur si besoin.
 
 Réponds STRICTEMENT en JSON avec ce format :
-{"reply":"ta réponse conversationnelle à l'utilisateur","schemaChanged":false,"dimensions":[],"facts":[],"confirmedRelations":[]}`;
+{"reply":"ta réponse conversationnelle à l'utilisateur","schemaChanged":false,"dimensions":[],"facts":[],"confirmedRelations":[],"subDimensions":[]}`;
 }
 
   private computeDiffExplanation(oldSchema: any, newSchema: any): string {
-    const changes: string[] = [];
+  const changes: string[] = [];
 
-    const oldDimensions = oldSchema.dimensions ?? [];
-    const oldFacts = oldSchema.facts ?? [];
-    const newDimensions = newSchema.dimensions ?? [];
-    const newFacts = newSchema.facts ?? [];
+  const oldDimensions = oldSchema.dimensions ?? [];
+  const oldFacts = oldSchema.facts ?? [];
+  const newDimensions = newSchema.dimensions ?? [];
+  const newFacts = newSchema.facts ?? [];
 
-    const movedToFacts = newFacts.filter((t: string) => oldDimensions.includes(t));
-    const movedToDimensions = newDimensions.filter((t: string) => oldFacts.includes(t));
+  const movedToFacts = newFacts.filter((t: string) => oldDimensions.includes(t));
+  const movedToDimensions = newDimensions.filter((t: string) => oldFacts.includes(t));
 
-    movedToFacts.forEach((t: string) => changes.push(`${t} déplacée de dimension vers fait`));
-    movedToDimensions.forEach((t: string) => changes.push(`${t} déplacée de fait vers dimension`));
+  movedToFacts.forEach((t: string) => changes.push(`${t} déplacée de dimension vers fait`));
+  movedToDimensions.forEach((t: string) => changes.push(`${t} déplacée de fait vers dimension`));
 
-    const addedDimensions = newDimensions.filter(
-      (t: string) => !oldDimensions.includes(t) && !oldFacts.includes(t),
-    );
-    const addedFacts = newFacts.filter((t: string) => !oldDimensions.includes(t) && !oldFacts.includes(t));
-    addedDimensions.forEach((t: string) => changes.push(`${t} ajoutée en dimension`));
-    addedFacts.forEach((t: string) => changes.push(`${t} ajoutée en fait`));
+  const addedDimensions = newDimensions.filter(
+    (t: string) => !oldDimensions.includes(t) && !oldFacts.includes(t),
+  );
+  const addedFacts = newFacts.filter((t: string) => !oldDimensions.includes(t) && !oldFacts.includes(t));
+  addedDimensions.forEach((t: string) => changes.push(`${t} ajoutée en dimension`));
+  addedFacts.forEach((t: string) => changes.push(`${t} ajoutée en fait`));
 
-    const oldRelations = oldSchema.confirmedRelations ?? [];
-    const newRelations = newSchema.confirmedRelations ?? [];
+  const oldRelations = oldSchema.confirmedRelations ?? [];
+  const newRelations = newSchema.confirmedRelations ?? [];
 
-    const relationKey = (r: any) => `${r.tableA}.${r.columnA}-${r.tableB}.${r.columnB}`;
-    const oldKeys = new Set(oldRelations.map(relationKey));
-    const newKeys = new Set(newRelations.map(relationKey));
+  const relationKey = (r: any) => `${r.tableA}.${r.columnA}-${r.tableB}.${r.columnB}`;
+  const oldKeys = new Set(oldRelations.map(relationKey));
+  const newKeys = new Set(newRelations.map(relationKey));
 
-    const added = newRelations.filter((r: any) => !oldKeys.has(relationKey(r)));
-    const removed = oldRelations.filter((r: any) => !newKeys.has(relationKey(r)));
+  const added = newRelations.filter((r: any) => !oldKeys.has(relationKey(r)));
+  const removed = oldRelations.filter((r: any) => !newKeys.has(relationKey(r)));
 
-    if (added.length > 0) changes.push(`${added.length} relation(s) ajoutée(s)`);
-    if (removed.length > 0) changes.push(`${removed.length} relation(s) supprimée(s)`);
+  if (added.length > 0) changes.push(`${added.length} relation(s) ajoutée(s)`);
+  if (removed.length > 0) changes.push(`${removed.length} relation(s) supprimée(s)`);
 
-    return changes.length > 0 ? changes.join(' ; ') : 'Aucun changement détecté dans le schéma';
-  }
+  // ✅ NOUVEAU : détecter les changements de sous-dimensions
+  const oldSubDims = oldSchema.subDimensions ?? [];
+  const newSubDims = newSchema.subDimensions ?? [];
+
+  const oldSubDimNames = new Set(oldSubDims.map((sd: any) => sd.name));
+  const newSubDimNames = new Set(newSubDims.map((sd: any) => sd.name));
+
+  const addedSubDims = newSubDims.filter((sd: any) => !oldSubDimNames.has(sd.name));
+  const removedSubDims = oldSubDims.filter((sd: any) => !newSubDimNames.has(sd.name));
+
+  addedSubDims.forEach((sd: any) => changes.push(`${sd.name} ajoutée comme sous-dimension`));
+  removedSubDims.forEach((sd: any) => changes.push(`${sd.name} retirée des sous-dimensions`));
+
+  return changes.length > 0 ? changes.join(' ; ') : 'Aucun changement détecté dans le schéma';
+}
 
 
 async applyChatModification(
@@ -1796,7 +1809,7 @@ async applyChatModification(
   currentSchema: any,
   userMessage: string,
 ): Promise<{ updatedSchema: AiSchemaProposal; explanation: string }> {
-  const metadata = await this.uploadService.buildMetadataForDatabase(database);
+  const metadata = await this.getMetadataWithCache(database);
   const validTableNames = new Set(metadata.map((cols) => cols[0]?.sourceTable).filter(Boolean));
   const validColumnsByTable = new Map<string, Set<string>>();
   for (const cols of metadata) {
@@ -1815,15 +1828,14 @@ async applyChatModification(
       const cleaned = rawResponse.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(cleaned);
 
-      // ✅ Que le schéma ait changé ou non, on repasse TOUJOURS par validateAndClean
-      // pour bénéficier du nettoyage (dédoublonnage DimTemps, etc.) — mais on utilise
-      // le schéma ACTUEL comme source si le modèle indique qu'il n'y a rien à changer
       const sourceForValidation = parsed.schemaChanged === false
         ? internalCurrentSchema
         : {
             dimensions: parsed.dimensions ?? internalCurrentSchema.dimensions,
             facts: parsed.facts ?? internalCurrentSchema.facts,
             confirmedRelations: parsed.confirmedRelations ?? internalCurrentSchema.confirmedRelations,
+            // ✅ FIX : prendre les subDimensions du modèle s'il y en a, sinon garder l'ancien
+            subDimensions: parsed.subDimensions ?? internalCurrentSchema.subDimensions,
           };
 
       const validated = this.validateAndClean(
@@ -1832,7 +1844,8 @@ async applyChatModification(
           facts: sourceForValidation.facts,
           confirmedRelations: sourceForValidation.confirmedRelations,
           additionalRelations: [],
-          subDimensions: internalCurrentSchema.subDimensions ?? [],
+          // ✅ FIX : utiliser sourceForValidation.subDimensions au lieu de internalCurrentSchema.subDimensions
+          subDimensions: sourceForValidation.subDimensions ?? [],
         } as any,
         validTableNames,
         validColumnsByTable,
@@ -1842,8 +1855,6 @@ async applyChatModification(
       const displayed = this.applyDisplayNames(validated);
 
       if (parsed.schemaChanged === false) {
-        // Pas de vraie modification demandée : on renvoie la version nettoyée,
-        // sans mention de "changement appliqué" même si le nettoyage a retiré des doublons
         return {
           updatedSchema: { ...displayed, rawResponse },
           explanation: parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?",
