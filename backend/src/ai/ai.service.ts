@@ -35,7 +35,8 @@ export class AiService {
   return tableName.replace(/^staging_/i, '');
 }
 
-private stripPrefix(t: string): string {
+private stripPrefix(t: unknown): string {
+  if (typeof t !== 'string') return '';
   return t.replace(/^staging_/i, '');
 }
 
@@ -1434,7 +1435,7 @@ private validateAndClean(
   validTableNames: Set<string>,
   validColumnsByTable: Map<string, Set<string>>,
   metadata: ColumnMetadata[][],
-  enforceFullCoverage: boolean = true, // ← NOUVEAU : true en génération initiale, false en mode chat
+  enforceFullCoverage: boolean = true,
 ): Omit<AiSchemaProposal, 'rawResponse'> {
   const warnings: string[] = [];
   const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
@@ -1482,9 +1483,6 @@ private validateAndClean(
     return true;
   });
 
-  // ✅ NOUVEAU : cette boucle ne s'applique QUE lors de la génération initiale.
-  // En mode chat (enforceFullCoverage = false), on respecte un retrait volontaire
-  // d'une table par l'utilisateur, même si elle existe physiquement dans le staging.
   if (enforceFullCoverage) {
     for (const tableName of validTableNames) {
       if (!seen.has(tableName)) {
@@ -1505,11 +1503,25 @@ private validateAndClean(
   }
 
   // --- 2. Validation structurelle des relations ---
+  // ✅ NOUVEAU : garde-fou de type, avant tout appel à .replace() via stripPrefix,
+  // pour éviter "t.replace is not a function" quand le modèle IA renvoie
+  // un tableA/tableB/columnA/columnB qui n'est pas une chaîne (objet, null, nombre...).
   const structurallyValid = (r: any): boolean => {
-    if (!r || !r.tableA || !r.columnA || !r.tableB || !r.columnB) {
-      warnings.push(`Relation incomplète ignorée: ${JSON.stringify(r)}`);
+    if (!r || typeof r !== 'object') {
+      warnings.push(`Relation ignorée (format invalide): ${JSON.stringify(r)}`);
       return false;
     }
+    if (
+      typeof r.tableA !== 'string' ||
+      typeof r.columnA !== 'string' ||
+      typeof r.tableB !== 'string' ||
+      typeof r.columnB !== 'string' ||
+      !r.tableA || !r.columnA || !r.tableB || !r.columnB
+    ) {
+      warnings.push(`Relation incomplète ou mal typée ignorée: ${JSON.stringify(r)}`);
+      return false;
+    }
+
     r.tableA = this.stripPrefix(r.tableA);
     r.tableB = this.stripPrefix(r.tableB);
 
@@ -1666,8 +1678,7 @@ private validateAndClean(
     }
   }
 
-  // --- 8.5. NOUVEAU : purge des relations vers des tables non classées ---
-  // (ex : une dimension retirée volontairement en mode chat ne doit garder aucune relation fantôme)
+  // --- 8.5. Purge des relations vers des tables non classées ---
   const classifiedStripped = new Set([
     ...cleanDimensions.map((t) => this.stripPrefix(t)),
     ...cleanFacts.map((t) => this.stripPrefix(t)),
@@ -1747,7 +1758,6 @@ private validateAndClean(
     warnings,
   };
 }
-
 private buildChatPrompt(currentSchema: any, userMessage: string): string {
   return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
 
