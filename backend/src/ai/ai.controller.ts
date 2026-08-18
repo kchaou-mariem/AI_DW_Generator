@@ -49,11 +49,29 @@ async chatModifySchema(
   @Param('database') database: string,
   @Param('sessionId') sessionId: number,
   @Body('message') message: string,
+  @Body('currentSchema') currentSchema: unknown,
 ) {
-  const history = await this.uploadService.getChatHistory(database, sessionId);
-  const currentSchema = history[history.length - 1].schema; // dernier état en date
+  let schemaToUse = currentSchema;
+  if (!schemaToUse) {
+    const history = await this.uploadService.getChatHistory(database, sessionId);
+    schemaToUse = history[history.length - 1].schema; // fallback si rien n'est fourni
+  }
 
-  const result = await this.aiService.applyChatModification(database, currentSchema, message);
+  const result = await this.aiService.applyChatModification(database, schemaToUse, message);
+
+  if (!result.schemaChanged) {
+    // ✅ Simple question / aucune modification réelle : pas de nouvel état créé
+    const history = await this.uploadService.getChatHistory(database, sessionId);
+    const lastStepNumber = history.length > 0 ? history[history.length - 1].stepNumber : 0;
+
+    return {
+      stepNumber: lastStepNumber, // on renvoie le dernier step existant, inchangé
+      schema: result.updatedSchema,
+      explanation: result.explanation,
+    };
+  }
+
+  // ✅ Modification réelle : on enregistre un nouvel état
   const { stepNumber } = await this.uploadService.addChatStep(
     database,
     sessionId,

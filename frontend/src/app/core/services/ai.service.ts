@@ -21,10 +21,17 @@ export class AiService {
     return this.http.post<SessionResponse>(`${this.baseUrl}/${database}/session/from-existing`, existingSchema);
   }
 
-  sendChatMessage(database: string, sessionId: number, message: string): Observable<ChatResponse> {
-    return this.http.post<ChatResponse>(`${this.baseUrl}/${database}/session/${sessionId}/chat`, { message });
-  }
-
+sendChatMessage(
+  database: string,
+  sessionId: number,
+  message: string,
+  currentSchema?: AiSchemaProposal,
+): Observable<ChatResponse> {
+  return this.http.post<ChatResponse>(`${this.baseUrl}/${database}/session/${sessionId}/chat`, {
+    message,
+    currentSchema: currentSchema ?? null,
+  });
+}
   revertToStep(database: string, sessionId: number, stepNumber: number): Observable<ChatResponse> {
     return this.http.post<ChatResponse>(
       `${this.baseUrl}/${database}/session/${sessionId}/revert/${stepNumber}`,

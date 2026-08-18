@@ -255,13 +255,11 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
   let lastError: string | null = null;
   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
     try {
-      // 🔥 Appels séquentiels (ou parallèles selon préférence)
       const rawResponse = await this.callOllama(prompt);
       const subDimensions = await this.detectSubDimensions(metadata);
 
       const parsed = this.parseAiResponse(rawResponse) as any;
 
-      // 🔥 NOUVEAU : Accepter toutes les relations par défaut, sauf celles rejetées
       const rejectedIndexes = new Set((parsed.rejectedRelationIndexes as number[]) ?? []);
 
       const selectedRelations = preFilterRelations
@@ -283,6 +281,7 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
         validTableNames,
         validColumnsByTable,
         metadata,
+        true, // ← génération initiale : chaque table du staging DOIT être classée
       );
 
       const displayed = this.applyDisplayNames(validated);
@@ -298,7 +297,6 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
     `L'IA n'a pas réussi à produire un schéma valide après ${this.MAX_RETRIES} tentatives. Dernière erreur: ${lastError}`,
   );
 }
-
 
  private findSubDimensionCandidates(metadata: ColumnMetadata[][]): string {
   const set = this.getSubDimensionCandidateSet(metadata);
@@ -1436,6 +1434,7 @@ private validateAndClean(
   validTableNames: Set<string>,
   validColumnsByTable: Map<string, Set<string>>,
   metadata: ColumnMetadata[][],
+  enforceFullCoverage: boolean = true, // ← NOUVEAU : true en génération initiale, false en mode chat
 ): Omit<AiSchemaProposal, 'rawResponse'> {
   const warnings: string[] = [];
   const hasDateColumn = metadata.some((table) => table.some((col) => col.dataType.toLowerCase().includes('date')));
@@ -1483,11 +1482,16 @@ private validateAndClean(
     return true;
   });
 
-  for (const tableName of validTableNames) {
-    if (!seen.has(tableName)) {
-      warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
-      cleanDimensions.push(tableName);
-      seen.add(tableName);
+  // ✅ NOUVEAU : cette boucle ne s'applique QUE lors de la génération initiale.
+  // En mode chat (enforceFullCoverage = false), on respecte un retrait volontaire
+  // d'une table par l'utilisateur, même si elle existe physiquement dans le staging.
+  if (enforceFullCoverage) {
+    for (const tableName of validTableNames) {
+      if (!seen.has(tableName)) {
+        warnings.push(`Table ${tableName} non classée par l'IA — ajoutée en dimension par défaut`);
+        cleanDimensions.push(tableName);
+        seen.add(tableName);
+      }
     }
   }
 
@@ -1560,7 +1564,6 @@ private validateAndClean(
   };
 
   // --- 4. Construire les relations confirmées ---
-  // ✅ FIX : .filter(structurallyValid) était manquant ici, causait le doublon DimTemps
   let confirmedRelations = parsed.confirmedRelations
     .filter(structurallyValid)
     .filter(isValidRelation)
@@ -1663,8 +1666,23 @@ private validateAndClean(
     }
   }
 
+  // --- 8.5. NOUVEAU : purge des relations vers des tables non classées ---
+  // (ex : une dimension retirée volontairement en mode chat ne doit garder aucune relation fantôme)
+  const classifiedStripped = new Set([
+    ...cleanDimensions.map((t) => this.stripPrefix(t)),
+    ...cleanFacts.map((t) => this.stripPrefix(t)),
+    ...subDimensions.map((sd) => sd.name),
+  ]);
+  const isFullyClassified = (r: any): boolean => {
+    const a = this.stripPrefix(r.tableA);
+    const b = this.stripPrefix(r.tableB);
+    return classifiedStripped.has(a) && classifiedStripped.has(b);
+  };
+  const finalConfirmedRelationsClean = finalConfirmedRelations.filter(isFullyClassified);
+  const additionalRelationsClean = additionalRelations.filter(isFullyClassified);
+
   // --- 9. Fallback : si aucune relation n'a été proposée par l'IA ---
-  if (finalConfirmedRelations.length === 0 && additionalRelations.length === 0) {
+  if (finalConfirmedRelationsClean.length === 0 && additionalRelationsClean.length === 0) {
     warnings.push("Aucune relation proposée par l'IA - utilisation des relations pré-détectées par heuristique");
 
     const preFilterRelations = this.uploadService.detectCrossTableRelations(metadata);
@@ -1682,12 +1700,12 @@ private validateAndClean(
         const colsB = normalizedValidColumns.get(tableB);
 
         if (colsA?.has(rel.columnA) && colsB?.has(rel.columnB)) {
-          const isDuplicate = finalConfirmedRelations.some(
+          const isDuplicate = finalConfirmedRelationsClean.some(
             (r: any) => r.tableA === tableA && r.columnA === rel.columnA && r.tableB === tableB && r.columnB === rel.columnB,
           );
 
           if (!isDuplicate) {
-            finalConfirmedRelations.push({
+            finalConfirmedRelationsClean.push({
               tableA,
               columnA: rel.columnA,
               tableB,
@@ -1720,8 +1738,8 @@ private validateAndClean(
   return {
     dimensions: cleanDimensions,
     facts: cleanFacts,
-    confirmedRelations: finalConfirmedRelations,
-    additionalRelations,
+    confirmedRelations: finalConfirmedRelationsClean,
+    additionalRelations: additionalRelationsClean,
     generatedDimensions,
     factColumnTransformations,
     subDimensions,
@@ -1808,7 +1826,7 @@ async applyChatModification(
   database: string,
   currentSchema: any,
   userMessage: string,
-): Promise<{ updatedSchema: AiSchemaProposal; explanation: string }> {
+): Promise<{ updatedSchema: AiSchemaProposal; explanation: string; schemaChanged: boolean }> {
   const metadata = await this.getMetadataWithCache(database);
   const validTableNames = new Set(metadata.map((cols) => cols[0]?.sourceTable).filter(Boolean));
   const validColumnsByTable = new Map<string, Set<string>>();
@@ -1821,6 +1839,10 @@ async applyChatModification(
 
   const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage);
 
+  // Nombre max de tables réelles pouvant disparaître en un seul message avant
+  // de considérer que c'est un oubli du modèle plutôt qu'un retrait volontaire.
+  const MAX_INTENTIONAL_TABLE_DROP = 2;
+
   let lastError: string | null = null;
   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
     try {
@@ -1828,13 +1850,52 @@ async applyChatModification(
       const cleaned = rawResponse.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(cleaned);
 
+      const previousDimensions: string[] = internalCurrentSchema.dimensions ?? [];
+      const previousFacts: string[] = internalCurrentSchema.facts ?? [];
+      const previousRealTables = new Set(
+        [...previousDimensions, ...previousFacts]
+          .map((t) => this.stripPrefix(t))
+          .filter((t) => validTableNames.has(t) || validTableNames.has(`staging_${t}`)),
+      );
+
+      const proposedDimensions: string[] = Array.isArray(parsed.dimensions) ? parsed.dimensions : [];
+      const proposedFacts: string[] = Array.isArray(parsed.facts) ? parsed.facts : [];
+      const proposedRealTables = new Set(
+        [...proposedDimensions, ...proposedFacts]
+          .map((t) => this.stripPrefix(t))
+          .filter((t) => validTableNames.has(t) || validTableNames.has(`staging_${t}`)),
+      );
+
+      const droppedTables = [...previousRealTables].filter((t) => !proposedRealTables.has(t));
+      const dropLooksIntentional =
+        droppedTables.length > 0 && droppedTables.length <= MAX_INTENTIONAL_TABLE_DROP;
+      const dropLooksLikeModelError = droppedTables.length > MAX_INTENTIONAL_TABLE_DROP;
+
+      if (dropLooksLikeModelError) {
+        console.warn(
+          `[applyChatModification] ${droppedTables.length} table(s) auraient disparu (${droppedTables.join(', ')}) — probable oubli du modèle, classification conservée telle quelle.`,
+        );
+      }
+
       const sourceForValidation = parsed.schemaChanged === false
         ? internalCurrentSchema
         : {
-            dimensions: parsed.dimensions ?? internalCurrentSchema.dimensions,
-            facts: parsed.facts ?? internalCurrentSchema.facts,
-            confirmedRelations: parsed.confirmedRelations ?? internalCurrentSchema.confirmedRelations,
-            // ✅ FIX : prendre les subDimensions du modèle s'il y en a, sinon garder l'ancien
+            // ✅ On ne fait confiance à la nouvelle classification que si :
+            //    - le tableau n'est pas vide, ET
+            //    - la perte de tables reste dans une plage plausible pour une action volontaire
+            dimensions:
+              proposedDimensions.length > 0 && !dropLooksLikeModelError
+                ? proposedDimensions
+                : previousDimensions,
+            facts:
+              proposedFacts.length > 0 && !dropLooksLikeModelError
+                ? proposedFacts
+                : previousFacts,
+            confirmedRelations: Array.isArray(parsed.confirmedRelations) && parsed.confirmedRelations.length > 0
+              ? parsed.confirmedRelations
+              : internalCurrentSchema.confirmedRelations,
+            // subDimensions PEUT légitimement devenir [] (ex: "retire toutes les sous-dimensions"),
+            // donc on ne retombe sur l'ancien tableau QUE si le champ est absent (undefined/null).
             subDimensions: parsed.subDimensions ?? internalCurrentSchema.subDimensions,
           };
 
@@ -1844,12 +1905,12 @@ async applyChatModification(
           facts: sourceForValidation.facts,
           confirmedRelations: sourceForValidation.confirmedRelations,
           additionalRelations: [],
-          // ✅ FIX : utiliser sourceForValidation.subDimensions au lieu de internalCurrentSchema.subDimensions
           subDimensions: sourceForValidation.subDimensions ?? [],
         } as any,
         validTableNames,
         validColumnsByTable,
         metadata,
+        false, // mode chat : ne force pas la ré-ajout d'une table volontairement retirée
       );
 
       const displayed = this.applyDisplayNames(validated);
@@ -1858,19 +1919,26 @@ async applyChatModification(
         return {
           updatedSchema: { ...displayed, rawResponse },
           explanation: parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?",
+          schemaChanged: false,
         };
       }
 
       const diffText = this.computeDiffExplanation(internalCurrentSchema, validated);
       const hasRealChange = diffText !== 'Aucun changement détecté dans le schéma';
 
-      const finalReply = hasRealChange
-        ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
-        : parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?";
+      const modelErrorNote = dropLooksLikeModelError
+        ? `\n\n(Note : ${droppedTables.length} table(s) semblaient disparaître de la classification de façon inattendue — classification d'origine conservée par sécurité, seules les relations/sous-dimensions demandées ont été appliquées.)`
+        : '';
+
+      const finalReply =
+        (hasRealChange
+          ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
+          : parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?") + modelErrorNote;
 
       return {
         updatedSchema: { ...displayed, rawResponse },
         explanation: finalReply,
+        schemaChanged: hasRealChange,
       };
     } catch (err) {
       lastError = err.message;

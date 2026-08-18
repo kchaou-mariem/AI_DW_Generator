@@ -180,53 +180,61 @@ export class SchemaPageComponent implements OnInit {
     });
   }
 
-  sendMessage(): void {
-    const text = this.userInput.trim();
-    if (!text || this.isSending || !this.sessionId) return;
+sendMessage(): void {
+  const text = this.userInput.trim();
+  if (!text || this.isSending || !this.sessionId || !this.schema) return;
 
-    this.messages.push({ role: 'user', text });
-    this.userInput = '';
-    this.isSending = true;
-    this.cdr.detectChanges();
+  this.messages.push({ role: 'user', text });
+  this.userInput = '';
+  this.isSending = true;
+  this.cdr.detectChanges();
 
-    this.aiService.sendChatMessage(this.database, this.sessionId, text).subscribe({
-      next: (response) => {
-        this.messages.push({ role: 'ai', text: response.explanation, stepNumber: response.stepNumber });
-        this.schema = response.schema;
-        this.currentStepNumber = response.stepNumber;
-        this.buildDiagram(response.schema);
-        this.refreshHistory();
-      },
-      error: (err) => {
-        this.errorMessage = 'Erreur : ' + (err.error?.message ?? err.message);
-        this.isSending = false;
-        this.cdr.detectChanges();
-      },
-      complete: () => {
-        this.isSending = false;
-        this.cdr.detectChanges();
-      },
-    });
-  }
+  this.aiService.sendChatMessage(this.database, this.sessionId, text, this.schema).subscribe({
+    next: (response) => {
+      this.messages.push({ role: 'ai', text: response.explanation, stepNumber: response.stepNumber });
+      this.schema = response.schema;
+      this.currentStepNumber = response.stepNumber;
+      this.buildDiagram(response.schema);
+      this.refreshHistory();
+    },
+    error: (err) => {
+      this.errorMessage = 'Erreur : ' + (err.error?.message ?? err.message);
+      this.isSending = false;
+      this.cdr.detectChanges();
+    },
+    complete: () => {
+      this.isSending = false;
+      this.cdr.detectChanges();
+    },
+  });
+}
 
-  // ---- Appelé par le panneau d'états (clic sur "État X") ----
-  revertToStep(stepNumber: number): void {
-    if (!this.sessionId) return;
+  // // ---- Appelé par le panneau d'états (clic sur "État X") ----
+  // revertToStep(stepNumber: number): void {
+  //   if (!this.sessionId) return;
 
-    this.aiService.revertToStep(this.database, this.sessionId, stepNumber).subscribe({
-      next: (response) => {
-        this.schema = response.schema;
-        this.currentStepNumber = response.stepNumber;
-        this.buildDiagram(response.schema);
-        this.refreshHistory();
-      },
-      error: (err) => {
-        this.errorMessage = 'Erreur retour arrière : ' + (err.error?.message ?? err.message);
-        this.cdr.detectChanges();
-      },
-      complete: () => this.cdr.detectChanges(),
-    });
-  }
+  //   this.aiService.revertToStep(this.database, this.sessionId, stepNumber).subscribe({
+  //     next: (response) => {
+  //       this.schema = response.schema;
+  //       this.currentStepNumber = response.stepNumber;
+  //       this.buildDiagram(response.schema);
+  //       this.refreshHistory();
+  //     },
+  //     error: (err) => {
+  //       this.errorMessage = 'Erreur retour arrière : ' + (err.error?.message ?? err.message);
+  //       this.cdr.detectChanges();
+  //     },
+  //     complete: () => this.cdr.detectChanges(),
+  //   });
+  // }
+
+  // Consultation LOCALE d'un état passé : aucun appel réseau, aucun nouveau step créé
+viewState(state: SchemaState): void {
+  this.schema = state.schema;
+  this.currentStepNumber = state.stepNumber;
+  this.buildDiagram(state.schema);
+  this.cdr.detectChanges();
+}
 
   // ---- Valider l'état actuellement affiché ----
   validateSchema(): void {
@@ -267,126 +275,139 @@ export class SchemaPageComponent implements OnInit {
   }
 
   private buildDiagram(schema: AiSchemaProposal): void {
-    const boxWidth = 170;
-    const headerHeight = 30;
-    const rowHeight = 18;
-    const maxAttrsShown = 3;
-    const laneGapY = 30;
+  const boxWidth = 170;
+  const headerHeight = 30;
+  const rowHeight = 18;
+  const maxAttrsShown = 3;
+  const laneGapY = 30;
 
-    const lanes = {
-      subLeft: 20,
-      dimLeft: 260,
-      fact: 560,
-      dimRight: 860,
-      subRight: 1100,
+  const lanes = {
+    subLeft: 20,
+    dimLeft: 260,
+    fact: 560,
+    dimRight: 860,
+    subRight: 1100,
+  };
+  const laneY: Record<string, number> = {
+    subLeft: 40,
+    dimLeft: 40,
+    fact: 40,
+    dimRight: 40,
+    subRight: 40,
+  };
+
+  const boxes: DiagramBox[] = [];
+  const positions = new Map<string, DiagramBox>();
+
+  const makeBox = (name: string, type: DiagramBox['type'], laneKey: keyof typeof lanes): DiagramBox => {
+    const attrs = (schema.tableAttributes[name] ?? []).map((a) => a.name);
+    const shown = attrs.slice(0, maxAttrsShown);
+    const extra = attrs.length - shown.length;
+    const height = headerHeight + shown.length * rowHeight + (extra > 0 ? rowHeight : 0) + 10;
+
+    const box: DiagramBox = {
+      id: name,
+      label: name,
+      type,
+      x: lanes[laneKey],
+      y: laneY[laneKey],
+      width: boxWidth,
+      height,
+      attributes: extra > 0 ? [...shown, `+${extra} autres`] : shown,
     };
-    const laneY: Record<string, number> = {
-      subLeft: 40,
-      dimLeft: 40,
-      fact: 40,
-      dimRight: 40,
-      subRight: 40,
-    };
+    laneY[laneKey] += height + laneGapY;
 
-    const boxes: DiagramBox[] = [];
-    const positions = new Map<string, DiagramBox>();
+    boxes.push(box);
+    positions.set(name, box);
+    return box;
+  };
 
-    const makeBox = (name: string, type: DiagramBox['type'], laneKey: keyof typeof lanes): DiagramBox => {
-      const attrs = (schema.tableAttributes[name] ?? []).map((a) => a.name);
-      const shown = attrs.slice(0, maxAttrsShown);
-      const extra = attrs.length - shown.length;
-      const height = headerHeight + shown.length * rowHeight + (extra > 0 ? rowHeight : 0) + 10;
+  const dims = schema.dimensions.filter((d) => !d.toLowerCase().includes('dimtemps'));
+  const timeDims = schema.dimensions.filter((d) => d.toLowerCase().includes('dimtemps'));
+  const facts = schema.facts;
+  const subDims = schema.subDimensions;
 
-      const box: DiagramBox = {
-        id: name,
-        label: name,
-        type,
-        x: lanes[laneKey],
-        y: laneY[laneKey],
-        width: boxWidth,
-        height,
-        attributes: extra > 0 ? [...shown, `+${extra} autres`] : shown,
-      };
-      laneY[laneKey] += height + laneGapY;
+  facts.forEach((f) => makeBox(f, 'fact', 'fact'));
+  timeDims.forEach((d) => makeBox(d, 'time', 'fact'));
 
-      boxes.push(box);
-      positions.set(name, box);
-      return box;
-    };
+  const dimLaneOf = new Map<string, 'dimLeft' | 'dimRight'>();
+  dims.forEach((d, i) => {
+    const lane: 'dimLeft' | 'dimRight' = i % 2 === 0 ? 'dimLeft' : 'dimRight';
+    dimLaneOf.set(d, lane);
+    makeBox(d, 'dimension', lane);
+  });
 
-    const dims = schema.dimensions.filter((d) => !d.toLowerCase().includes('dimtemps'));
-    const timeDims = schema.dimensions.filter((d) => d.toLowerCase().includes('dimtemps'));
-    const facts = schema.facts;
-    const subDims = schema.subDimensions;
+  subDims.forEach((sd) => {
+    const parentLane = dimLaneOf.get(sd.parentDimension);
+    const subLane: keyof typeof lanes = parentLane === 'dimRight' ? 'subRight' : 'subLeft';
+    makeBox(sd.name, 'subdimension', subLane);
+  });
 
-    facts.forEach((f) => makeBox(f, 'fact', 'fact'));
-    timeDims.forEach((d) => makeBox(d, 'time', 'fact'));
+  this.diagramBoxes = boxes;
 
-    const dimLaneOf = new Map<string, 'dimLeft' | 'dimRight'>();
-    dims.forEach((d, i) => {
-      const lane: 'dimLeft' | 'dimRight' = i % 2 === 0 ? 'dimLeft' : 'dimRight';
-      dimLaneOf.set(d, lane);
-      makeBox(d, 'dimension', lane);
-    });
+  const factSet = new Set(schema.facts);
+  const lines: DiagramLine[] = [];
 
-    subDims.forEach((sd) => {
-      const parentLane = dimLaneOf.get(sd.parentDimension);
-      const subLane: keyof typeof lanes = parentLane === 'dimRight' ? 'subRight' : 'subLeft';
-      makeBox(sd.name, 'subdimension', subLane);
-    });
+  for (const rel of schema.confirmedRelations) {
+    const a = positions.get(rel.tableA);
+    const b = positions.get(rel.tableB);
+    if (!a || !b) continue;
 
-    this.diagramBoxes = boxes;
+    const factIsA = factSet.has(rel.tableA);
+    const from = factIsA ? a : b;
+    const to = factIsA ? b : a;
 
-    const factSet = new Set(schema.facts);
-    const lines: DiagramLine[] = [];
+    const fromCenter = { x: from.x + from.width / 2, y: from.y + from.height / 2 };
+    const toCenter = { x: to.x + to.width / 2, y: to.y + to.height / 2 };
 
-    for (const rel of schema.confirmedRelations) {
-      const a = positions.get(rel.tableA);
-      const b = positions.get(rel.tableB);
-      if (!a || !b) continue;
+    const start = this.getEdgePoint(from, toCenter);
+    const end = this.getEdgePoint(to, fromCenter);
 
-      const factIsA = factSet.has(rel.tableA);
-      const from = factIsA ? a : b;
-      const to = factIsA ? b : a;
-
-      const fromCenter = { x: from.x + from.width / 2, y: from.y + from.height / 2 };
-      const toCenter = { x: to.x + to.width / 2, y: to.y + to.height / 2 };
-
-      const start = this.getEdgePoint(from, toCenter);
-      const end = this.getEdgePoint(to, fromCenter);
-
-      lines.push({ x1: start.x, y1: start.y, x2: end.x, y2: end.y, kind: 'fact-dim' });
-    }
-
-    for (const sd of schema.subDimensions) {
-      const parent = positions.get(sd.parentDimension);
-      const child = positions.get(sd.name);
-      if (!parent || !child) continue;
-
-      const parentCenter = { x: parent.x + parent.width / 2, y: parent.y + parent.height / 2 };
-      const childCenter = { x: child.x + child.width / 2, y: child.y + child.height / 2 };
-
-      const start = this.getEdgePoint(parent, childCenter);
-      const end = this.getEdgePoint(child, parentCenter);
-
-      lines.push({ x1: start.x, y1: start.y, x2: end.x, y2: end.y, kind: 'dim-subdim' });
-    }
-
-    this.diagramLines = lines;
-
-    const maxX = Math.max(...boxes.map((b) => b.x + b.width), 1000) + 40;
-    const maxY = Math.max(...boxes.map((b) => b.y + b.height), 600) + 40;
-    this.diagramWidth = maxX;
-    this.diagramHeight = maxY;
-
-    const relCount = schema.confirmedRelations.length;
-    const shape = facts.length > 1 ? 'en constellation (plusieurs faits)' : 'en étoile (un seul fait)';
-    this.summaryText =
-      `Ce schéma ${shape} contient ${facts.length} table(s) de fait, ${dims.length} dimension(s)` +
-      (subDims.length > 0 ? `, ${subDims.length} sous-dimension(s)` : '') +
-      ` et ${relCount} relation(s) confirmée(s).`;
+    lines.push({ x1: start.x, y1: start.y, x2: end.x, y2: end.y, kind: 'fact-dim' });
   }
 
+  for (const sd of schema.subDimensions) {
+    const parent = positions.get(sd.parentDimension);
+    const child = positions.get(sd.name);
+    if (!parent || !child) continue;
+
+    const parentCenter = { x: parent.x + parent.width / 2, y: parent.y + parent.height / 2 };
+    const childCenter = { x: child.x + child.width / 2, y: child.y + child.height / 2 };
+
+    const start = this.getEdgePoint(parent, childCenter);
+    const end = this.getEdgePoint(child, parentCenter);
+
+    lines.push({ x1: start.x, y1: start.y, x2: end.x, y2: end.y, kind: 'dim-subdim' });
+  }
+
+  this.diagramLines = lines;
+
+  const maxX = Math.max(...boxes.map((b) => b.x + b.width), 1000) + 40;
+  const maxY = Math.max(...boxes.map((b) => b.y + b.height), 600) + 40;
+  this.diagramWidth = maxX;
+  this.diagramHeight = maxY;
+
+  // ✅ NOUVEAU : détection du type de schéma tenant compte des sous-dimensions
+  const relCount = schema.confirmedRelations.length;
+  const isSnowflake = subDims.length > 0;
+  const isConstellation = facts.length > 1;
+
+  let shape: string;
+  if (isConstellation && isSnowflake) {
+    shape = 'en constellation avec flocon de neige (plusieurs faits, dimensions normalisées)';
+  } else if (isConstellation) {
+    shape = 'en constellation (plusieurs faits)';
+  } else if (isSnowflake) {
+    shape = 'en flocon de neige (dimensions normalisées en sous-dimensions)';
+  } else {
+    shape = 'en étoile (un seul fait, dimensions non normalisées)';
+  }
+
+  this.summaryText =
+    `Ce schéma ${shape} contient ${facts.length} table(s) de fait, ${dims.length} dimension(s)` +
+    (subDims.length > 0 ? `, ${subDims.length} sous-dimension(s)` : '') +
+    ` et ${relCount} relation(s) confirmée(s).`;
+}
   private getEdgePoint(box: DiagramBox, towards: { x: number; y: number }): { x: number; y: number } {
     const cx = box.x + box.width / 2;
     const cy = box.y + box.height / 2;

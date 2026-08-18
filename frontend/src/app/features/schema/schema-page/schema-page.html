@@ -19,16 +19,16 @@
       <div class="d-flex flex-wrap align-items-center gap-2 mb-3" *ngIf="states.length > 0">
         <span class="text-muted small me-1">Historique :</span>
         <div class="btn-group" *ngFor="let s of states" role="group">
-          <button
-            type="button"
-            class="btn btn-sm"
-            [ngClass]="s.stepNumber === currentStepNumber ? 'btn-primary' : 'btn-outline-secondary'"
-            (click)="revertToStep(s.stepNumber)"
-            [title]="'Revenir à ' + s.label"
-          >
-            {{ s.label }}
-            <span *ngIf="validatedStepNumber === s.stepNumber" title="Validé">✓</span>
-          </button>
+     <button
+        type="button"
+        class="btn btn-sm"
+        [ngClass]="s.stepNumber === currentStepNumber ? 'btn-primary' : 'btn-outline-secondary'"
+        (click)="viewState(s)"
+        [title]="'Voir ' + s.label"
+        >
+        {{ s.label }}
+        <span *ngIf="validatedStepNumber === s.stepNumber" title="Validé">✓</span>
+        </button>
           <button
             type="button"
             class="btn btn-sm btn-outline-success"
