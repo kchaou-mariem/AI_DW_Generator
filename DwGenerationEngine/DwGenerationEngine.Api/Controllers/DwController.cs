@@ -121,18 +121,21 @@ public class DwController : ControllerBase
     private readonly IEtlRunner _etlRunner;
     private readonly ITabularModelDeployer _tabularDeployer;
     private readonly ILogger<DwController> _logger;
+    private readonly IPipelineOrchestrator _pipelineOrchestrator; 
 
-    public DwController(
-        IDdlGenerator ddlGenerator,
-        IEtlRunner etlRunner,
-        ITabularModelDeployer tabularDeployer,
-        ILogger<DwController> logger)
-    {
-        _ddlGenerator = ddlGenerator;
-        _etlRunner = etlRunner;
-        _tabularDeployer = tabularDeployer;
-        _logger = logger;
-    }
+ public DwController(
+    IDdlGenerator ddlGenerator,
+    IEtlRunner etlRunner,
+    ITabularModelDeployer tabularDeployer,
+    IPipelineOrchestrator pipelineOrchestrator,
+    ILogger<DwController> logger)
+{
+    _ddlGenerator = ddlGenerator;
+    _etlRunner = etlRunner;
+    _tabularDeployer = tabularDeployer;
+    _pipelineOrchestrator = pipelineOrchestrator;
+    _logger = logger;
+}
 
     [HttpPost("run-etl")]
     public async Task<ActionResult<EtlResponseDto>> RunEtl([FromBody] EtlRequestDto request)
@@ -209,4 +212,48 @@ public class DwController : ControllerBase
 
     [HttpGet("health")]
     public IActionResult Health() => Ok(new { status = "ok" });
+
+    ////////////////////
+
+    [HttpPost("build-full-pipeline")]
+public async Task<ActionResult<PipelineResponseDto>> BuildFullPipeline([FromBody] PipelineRequestDto request)
+{
+    _logger.LogInformation("Pipeline complet demandé pour: {DwDatabase}", request.Schema.DwDatabase);
+
+    try
+    {
+        var result = await _pipelineOrchestrator.RunFullPipelineAsync(request.Schema);
+
+        return Ok(new PipelineResponseDto
+        {
+            Success = result.Success,
+            StoppedAtStep = result.StoppedAtStep,
+            Ddl = result.DdlResult == null ? null : new GenerateResponseDto
+            {
+                Success = result.DdlResult.Success,
+                CreatedTables = result.DdlResult.CreatedTables,
+                Errors = result.DdlResult.Errors,
+            },
+            Etl = result.EtlResult == null ? null : new EtlResponseDto
+            {
+                Success = result.EtlResult.Success,
+                Tables = result.EtlResult.Tables,
+                Errors = result.EtlResult.Errors,
+            },
+            Tabular = result.TabularResult == null ? null : new TabularDeployResponseDto
+            {
+                Success = result.TabularResult.Success,
+                CreatedTables = result.TabularResult.CreatedTables,
+                CreatedRelationships = result.TabularResult.CreatedRelationships,
+                CreatedMeasures = result.TabularResult.CreatedMeasures,
+                Errors = result.TabularResult.Errors,
+            },
+        });
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Erreur inattendue dans le pipeline complet");
+        return StatusCode(500, new PipelineResponseDto { Success = false, StoppedAtStep = "unexpected_error" });
+    }
+}
 }
