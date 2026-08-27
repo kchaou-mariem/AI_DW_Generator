@@ -66,6 +66,8 @@ public class DdlGenerator : IDdlGenerator
                 .Concat(schema.SubDimensions.Select(sd => sd.Name))
                 .Concat(schema.GeneratedDimensions.Select(gd => gd.Name))
                 .ToList();
+            // Nettoie les tables orphelines d'un schéma précédent qui ne font plus partie du schéma actuel
+            result.DroppedOrphanTables = await DropOrphanTablesAsync(connection, allTableNames);   // ← LIGNE MANQUANTE À AJOUTER
 
             await DropAllForeignKeysAsync(connection, allTableNames);
             foreach (var tableName in dropOrder)
@@ -255,4 +257,36 @@ public class DdlGenerator : IDdlGenerator
         using var command = new SqlCommand(sql, connection);
         await command.ExecuteNonQueryAsync();
     }
+    private static async Task<List<string>> DropOrphanTablesAsync(SqlConnection connection, List<string> expectedTableNames)
+{
+    var existingTablesSql = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';";
+    var existingTables = new List<string>();
+
+    using (var command = new SqlCommand(existingTablesSql, connection))
+    using (var reader = await command.ExecuteReaderAsync())
+    {
+        while (await reader.ReadAsync())
+        {
+            existingTables.Add(reader.GetString(0));
+        }
+    }
+
+    var orphanTables = existingTables
+        .Where(t => !expectedTableNames.Contains(t, StringComparer.OrdinalIgnoreCase))
+        .ToList();
+
+    if (orphanTables.Count == 0) return orphanTables;
+
+    // Supprime d'abord toutes les FK des tables orphelines (elles peuvent référencer
+    // ou être référencées par d'autres tables), puis les tables elles-mêmes.
+    await DropAllForeignKeysAsync(connection, orphanTables);
+
+    foreach (var tableName in orphanTables)
+    {
+        var dropSql = $"IF OBJECT_ID('dbo.[{tableName}]', 'U') IS NOT NULL DROP TABLE [dbo].[{tableName}];";
+        await ExecuteNonQueryAsync(connection, dropSql);
+    }
+
+    return orphanTables;
+}
 }

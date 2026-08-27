@@ -1,7 +1,7 @@
 using DwGenerationEngine.Core.Interfaces;
 using DwGenerationEngine.Infrastructure.Sql;
 using DwGenerationEngine.Infrastructure.Tabular;
-
+using DwGenerationEngine.Api.Middleware;
 using DwGenerationEngine.Infrastructure.Orchestration;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -25,6 +25,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseMiddleware<ApiKeyMiddleware>();
 app.UseAuthorization();
 app.MapControllers();
 

@@ -15,6 +15,8 @@ public class DdlGenerationResult
 {
     public bool Success { get; set; }
     public List<string> CreatedTables { get; set; } = new();
+    public List<string> DroppedOrphanTables { get; set; } = new(); // ← nouveau
+
     public List<string> Errors { get; set; } = new();
     public List<string> ExecutedScripts { get; set; } = new();
 }

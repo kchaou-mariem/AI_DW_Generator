@@ -750,11 +750,13 @@ async deployDataWarehouse(database: string, dwDatabase: string) {
   const payload = await this.buildDotNetSchemaPayload(database, dwDatabase, latest.schema);
 
   const dotNetApiUrl = this.configService.get('DOTNET_ENGINE_URL') ?? 'http://localhost:5254';
+  const dotNetApiKey = this.configService.get('DOTNET_ENGINE_API_KEY');
 
   const response = await firstValueFrom(
-    this.httpService.post(`${dotNetApiUrl}/api/dw/build-full-pipeline`, { schema: payload }, {
-      timeout: 120000, // 2 minutes, le Process Tabular peut être long
-    }),
+  this.httpService.post(`${dotNetApiUrl}/api/dw/build-full-pipeline`, { schema: payload }, {
+    timeout: 120000,
+    headers: { 'X-Api-Key': dotNetApiKey },
+  }),
   );
 
   return response.data;
