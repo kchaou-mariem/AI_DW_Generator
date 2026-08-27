@@ -15,6 +15,7 @@ import { UploadModule } from './upload/upload.module';
 import { config } from 'rxjs/internal/config';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AiModule } from './ai/ai.module';
+import { HttpModule } from '@nestjs/axios';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { AiModule } from './ai/ai.module';
     }),
     UploadModule,
     AiModule,
+    HttpModule,
   ],
 })
 export class AppModule {}

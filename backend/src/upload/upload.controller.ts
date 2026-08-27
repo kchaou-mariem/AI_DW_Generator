@@ -77,4 +77,15 @@ export class UploadController {
       throw new BadRequestException(`Le fichier ${file.originalname} est vide`);
     }
   }
+
+@Post(':database/deploy')
+async deployDw(
+  @Param('database') database: string,
+  @Body('dwDatabase') dwDatabase: string,
+) {
+  if (!dwDatabase) {
+    throw new BadRequestException('Le nom de la base DW cible (dwDatabase) est requis');
+  }
+  return this.uploadService.deployDataWarehouse(database, dwDatabase);
+}
 }

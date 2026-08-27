@@ -4,6 +4,8 @@ import * as sql from 'mssql';
 import csv from 'csv-parser';
 import { Readable } from 'stream';
 import * as XLSX from 'xlsx';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
 
 export interface ColumnMetadata {
   sourceTable: string;
@@ -32,7 +34,7 @@ export interface CrossTableRelation {
 
 @Injectable()
 export class UploadService {
-  constructor(private configService: ConfigService) {}
+  constructor(private configService: ConfigService,private httpService: HttpService,) {}
 
   private getBaseConfig(): sql.config {
   return {
@@ -630,5 +632,127 @@ async getSchemaAtStep(database: string, sessionId: number, stepNumber: number): 
   } finally {
     await pool.close();
   }
+}
+
+/**
+ * Construit le SchemaProposal au format attendu par l'API .NET
+ * (retire le préfixe staging_, ajoute tableAttributes réelles depuis staging).
+ */
+private async buildDotNetSchemaPayload(database: string, dwDatabase: string, rawSchema: any) {
+  const stripPrefix = (name: string) => name.replace(/^staging_/, '');
+
+  const dimensions = (rawSchema.dimensions ?? []).map(stripPrefix).filter((d: string) => d !== 'DimTemps');
+  const facts = (rawSchema.facts ?? []).map(stripPrefix);
+
+  const confirmedRelations = (rawSchema.confirmedRelations ?? []).map((r: any) => ({
+    tableA: stripPrefix(r.tableA),
+    columnA: r.columnA,
+    tableB: stripPrefix(r.tableB),
+    columnB: r.columnB,
+    reason: r.reason,
+  }));
+
+  const factColumnTransformations = (rawSchema.factColumnTransformations ?? []).map((t: any) => ({
+    factTable: stripPrefix(t.factTable),
+    originalColumn: t.originalColumn,
+    newColumn: t.newColumn,
+    newColumnType: t.newColumnType,
+    referencesTable: t.referencesTable,
+    referencesColumn: t.referencesColumn,
+  }));
+
+  const subDimensions = (rawSchema.subDimensions ?? []).map((sd: any) => ({
+    name: sd.name,
+    parentDimension: stripPrefix(sd.parentDimension),
+    sourceColumn: sd.sourceColumn,
+    generatedPrimaryKey: sd.generatedPrimaryKey,
+  }));
+
+  const generatedDimensions = rawSchema.generatedDimensions ?? [];
+
+  // tableAttributes : colonnes réelles lues depuis le staging pour chaque dimension/fait
+  const tableAttributes: Record<string, { name: string; type: string }[]> = {};
+
+  const pool = await this.getPool(database);
+  try {
+    for (const tableName of [...dimensions, ...facts]) {
+      const stagingTable = `staging_${tableName}`;
+      const columnsResult = await pool.request().query(`
+        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = '${stagingTable}'
+        ORDER BY ORDINAL_POSITION
+      `);
+
+      tableAttributes[tableName] = columnsResult.recordset.map((c) => ({
+        name: c.COLUMN_NAME,
+        type: this.mapSqlTypeForDw(c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE),
+      }));
+    }
+
+    // Colonnes des sous-dimensions et dimensions générées (structure fixe, pas de lecture staging)
+    for (const sd of subDimensions) {
+      tableAttributes[sd.name] = [
+        { name: sd.generatedPrimaryKey, type: 'INT' },
+        { name: sd.sourceColumn, type: 'VARCHAR(255)' },
+      ];
+    }
+    for (const gd of generatedDimensions) {
+      tableAttributes[gd.name] = gd.columns.map((c: any) => ({ name: c.name, type: c.type }));
+    }
+  } finally {
+    await pool.close();
+  }
+
+  return {
+    stagingDatabase: database,
+    dwDatabase,
+    dimensions,
+    facts,
+    confirmedRelations,
+    generatedDimensions,
+    factColumnTransformations,
+    subDimensions,
+    tableAttributes,
+  };
+}
+
+private mapSqlTypeForDw(dataType: string, maxLength: number | null, precision: number | null, scale: number | null): string {
+  const type = dataType.toLowerCase();
+  if (type === 'varchar' || type === 'nvarchar') {
+    const len = maxLength && maxLength > 0 && maxLength <= 4000 ? maxLength : 255;
+    return `VARCHAR(${len})`;
+  }
+  if (type === 'decimal' || type === 'numeric') {
+    return `DECIMAL(${precision ?? 18},${scale ?? 4})`;
+  }
+  if (type === 'int') return 'INT';
+  if (type === 'date') return 'DATE';
+  if (type === 'datetime' || type === 'datetime2') return 'DATETIME';
+  if (type === 'bit') return 'BIT';
+  return 'VARCHAR(255)';
+}
+
+/**
+ * Déclenche le pipeline complet (DDL + ETL + Tabular) via l'API .NET,
+ * à partir du dernier schéma validé pour cette base staging.
+ */
+async deployDataWarehouse(database: string, dwDatabase: string) {
+  const latest = await this.getLatestSchemaValidation(database);
+  if (!latest) {
+    throw new BadRequestException(`Aucun schéma validé trouvé pour ${database}`);
+  }
+
+  const payload = await this.buildDotNetSchemaPayload(database, dwDatabase, latest.schema);
+
+  const dotNetApiUrl = this.configService.get('DOTNET_ENGINE_URL') ?? 'http://localhost:5254';
+
+  const response = await firstValueFrom(
+    this.httpService.post(`${dotNetApiUrl}/api/dw/build-full-pipeline`, { schema: payload }, {
+      timeout: 120000, // 2 minutes, le Process Tabular peut être long
+    }),
+  );
+
+  return response.data;
 }
 }
