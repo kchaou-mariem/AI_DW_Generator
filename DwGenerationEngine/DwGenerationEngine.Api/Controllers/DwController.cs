@@ -110,7 +110,7 @@
 using Microsoft.AspNetCore.Mvc;
 using DwGenerationEngine.Api.DTOs;
 using DwGenerationEngine.Core.Interfaces;
-
+using DwGenerationEngine.Core.Services;
 namespace DwGenerationEngine.Api.Controllers;
 
 [ApiController]
@@ -140,7 +140,17 @@ public class DwController : ControllerBase
     [HttpPost("run-etl")]
     public async Task<ActionResult<EtlResponseDto>> RunEtl([FromBody] EtlRequestDto request)
     {
-        _logger.LogInformation("ETL demandé pour la base DW: {DwDatabase}", request.Schema.DwDatabase);
+        var validation = SchemaValidator.Validate(request.Schema);
+    if (!validation.IsValid)
+    {
+        _logger.LogWarning("Schéma invalide pour generate-ddl: {Errors}", string.Join(" | ", validation.Errors));
+        return BadRequest(new GenerateResponseDto
+        {
+            Success = false,
+            Errors = validation.Errors,
+        });
+    }
+    _logger.LogInformation("ETL demandé pour la base DW: {DwDatabase}", request.Schema.DwDatabase);
 
         try
         {
@@ -162,6 +172,16 @@ public class DwController : ControllerBase
     [HttpPost("generate-ddl")]
     public async Task<ActionResult<GenerateResponseDto>> GenerateDdl([FromBody] GenerateRequestDto request)
     {
+       var validation = SchemaValidator.Validate(request.Schema);
+    if (!validation.IsValid)
+    {
+        _logger.LogWarning("Schéma invalide pour generate-ddl: {Errors}", string.Join(" | ", validation.Errors));
+        return BadRequest(new GenerateResponseDto
+        {
+            Success = false,
+            Errors = validation.Errors,
+        });
+    }
         _logger.LogInformation("Génération DDL demandée pour la base DW: {DwDatabase}", request.Schema.DwDatabase);
 
         try
@@ -189,6 +209,16 @@ public class DwController : ControllerBase
     [HttpPost("deploy-tabular")]
     public async Task<ActionResult<TabularDeployResponseDto>> DeployTabular([FromBody] TabularDeployRequestDto request)
     {
+        var validation = SchemaValidator.Validate(request.Schema);
+    if (!validation.IsValid)
+    {
+        _logger.LogWarning("Schéma invalide pour generate-ddl: {Errors}", string.Join(" | ", validation.Errors));
+        return BadRequest(new GenerateResponseDto
+        {
+            Success = false,
+            Errors = validation.Errors,
+        });
+    }
         _logger.LogInformation("Déploiement Tabular demandé pour: {DwDatabase}", request.Schema.DwDatabase);
 
         try
@@ -218,7 +248,18 @@ public class DwController : ControllerBase
     [HttpPost("build-full-pipeline")]
 public async Task<ActionResult<PipelineResponseDto>> BuildFullPipeline([FromBody] PipelineRequestDto request)
 {
-    _logger.LogInformation("Pipeline complet demandé pour: {DwDatabase}", request.Schema.DwDatabase);
+    var validation = SchemaValidator.Validate(request.Schema);
+    if (!validation.IsValid)
+    {
+        _logger.LogWarning("Schéma invalide pour generate-ddl: {Errors}", string.Join(" | ", validation.Errors));
+        return BadRequest(new GenerateResponseDto
+        {
+            Success = false,
+            Errors = validation.Errors,
+        });
+    }
+
+    _logger.LogInformation("Génération DDL demandée pour la base DW: {DwDatabase}", request.Schema.DwDatabase);
 
     try
     {

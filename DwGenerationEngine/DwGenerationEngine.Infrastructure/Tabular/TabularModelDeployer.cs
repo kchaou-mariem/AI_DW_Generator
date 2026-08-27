@@ -194,13 +194,15 @@ public class TabularModelDeployer : ITabularModelDeployer
         return table;
     }
 
-    private static DataType MapDataType(string sqlType)
-    {
-        var t = sqlType.ToUpperInvariant();
-        if (t.Contains("INT")) return DataType.Int64;
-        if (t.Contains("DECIMAL") || t.Contains("NUMERIC")) return DataType.Decimal;
-        if (t.Contains("DATE")) return DataType.DateTime;
-        if (t.Contains("BIT") || t.Contains("BOOL")) return DataType.Boolean;
-        return DataType.String;
-    }
+   private static DataType MapDataType(string sqlType)
+{
+    var t = sqlType.ToUpperInvariant();
+    if (t.Contains("BIGINT")) return DataType.Int64;
+    if (t.Contains("INT")) return DataType.Int64;
+    if (t.Contains("DECIMAL") || t.Contains("NUMERIC")) return DataType.Decimal;
+    if (t.Contains("FLOAT") || t.Contains("REAL")) return DataType.Double;
+    if (t.Contains("DATE")) return DataType.DateTime; // couvre DATE, DATETIME, DATETIME2
+    if (t.Contains("BIT") || t.Contains("BOOL")) return DataType.Boolean;
+    return DataType.String; // VARCHAR, NVARCHAR, NVARCHAR(MAX), et tout type non reconnu
+}
 }

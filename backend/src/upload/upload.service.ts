@@ -720,6 +720,8 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
 private mapSqlTypeForDw(dataType: string, maxLength: number | null, precision: number | null, scale: number | null): string {
   const type = dataType.toLowerCase();
   if (type === 'varchar' || type === 'nvarchar') {
+    // maxLength vaut -1 en SQL Server pour un type déclaré MAX (ex: NVARCHAR(MAX))
+    if (maxLength === -1) return 'NVARCHAR(MAX)';
     const len = maxLength && maxLength > 0 && maxLength <= 4000 ? maxLength : 255;
     return `VARCHAR(${len})`;
   }
@@ -727,8 +729,10 @@ private mapSqlTypeForDw(dataType: string, maxLength: number | null, precision: n
     return `DECIMAL(${precision ?? 18},${scale ?? 4})`;
   }
   if (type === 'int') return 'INT';
+  if (type === 'bigint') return 'BIGINT';
+  if (type === 'float' || type === 'real') return 'FLOAT';
   if (type === 'date') return 'DATE';
-  if (type === 'datetime' || type === 'datetime2') return 'DATETIME';
+  if (type === 'datetime' || type === 'datetime2' || type === 'smalldatetime') return 'DATETIME2';
   if (type === 'bit') return 'BIT';
   return 'VARCHAR(255)';
 }

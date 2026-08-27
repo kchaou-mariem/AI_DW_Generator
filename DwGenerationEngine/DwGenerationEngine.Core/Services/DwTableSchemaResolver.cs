@@ -63,15 +63,21 @@ public static class DwTableSchemaResolver
 
     /// <summary>Colonnes numériques éligibles à des mesures d'agrégation (exclut les clés techniques).</summary>
     public static List<string> GetNumericMeasureColumns(string factName, SchemaProposal schema)
-    {
-        var columns = GetColumns(factName, schema);
-        var pkColumn = $"{factName}Id";
+{
+    var columns = GetColumns(factName, schema);
+    var pkColumn = $"{factName}Id";
 
-        return columns
-            .Where(c => !c.Name.Equals(pkColumn, StringComparison.OrdinalIgnoreCase))
-            .Where(c => !c.Name.EndsWith("Id", StringComparison.OrdinalIgnoreCase) && !c.Name.EndsWith("Key", StringComparison.OrdinalIgnoreCase))
-            .Where(c => c.SqlType.Contains("INT", StringComparison.OrdinalIgnoreCase) || c.SqlType.Contains("DECIMAL", StringComparison.OrdinalIgnoreCase) || c.SqlType.Contains("NUMERIC", StringComparison.OrdinalIgnoreCase))
-            .Select(c => c.Name)
-            .ToList();
-    }
+    return columns
+        .Where(c => !c.Name.Equals(pkColumn, StringComparison.OrdinalIgnoreCase))
+        .Where(c => !c.Name.EndsWith("Id", StringComparison.OrdinalIgnoreCase) && !c.Name.EndsWith("Key", StringComparison.OrdinalIgnoreCase))
+        .Where(c => IsNumericSqlType(c.SqlType))
+        .Select(c => c.Name)
+        .ToList();
+}
+
+private static bool IsNumericSqlType(string sqlType)
+{
+    var t = sqlType.ToUpperInvariant();
+    return t.Contains("INT") || t.Contains("DECIMAL") || t.Contains("NUMERIC") || t.Contains("FLOAT") || t.Contains("REAL");
+}
 }
