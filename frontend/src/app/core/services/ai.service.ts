@@ -3,9 +3,19 @@ import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import { AiSchemaProposal, ChatResponse, SessionResponse } from '../models/schema.model';
 
+export interface DeployResult {
+  success: boolean;
+  stoppedAtStep: string;
+  ddl?: any;
+  etl?: any;
+  tabular?: any;
+}
+
 @Injectable({ providedIn: 'root' })
 export class AiService {
   private readonly baseUrl = 'http://localhost:3000/ai/schema';
+  private readonly uploadBaseUrl = 'http://localhost:3000/upload'; // ← nouveau
+
 
   constructor(private http: HttpClient) {}
 
@@ -49,5 +59,9 @@ sendChatMessage(
 
   getValidatedSchema(database: string): Observable<{ schema: AiSchemaProposal; createdAt: string }> {
     return this.http.get<{ schema: AiSchemaProposal; createdAt: string }>(`${this.baseUrl}/${database}/validate`);
+  }
+
+  deployDataWarehouse(database: string, dwDatabase: string): Observable<DeployResult> {
+    return this.http.post<DeployResult>(`${this.uploadBaseUrl}/${database}/deploy`, { dwDatabase });
   }
 }

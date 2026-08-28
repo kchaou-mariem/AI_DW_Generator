@@ -9,7 +9,7 @@ namespace DwGenerationEngine.Core.Services;
 /// </summary>
 public static class FactRelationResolver
 {
-    public static List<FactDimensionLink> Resolve(SchemaProposal schema)
+   public static List<FactDimensionLink> Resolve(SchemaProposal schema)
 {
     var links = new List<FactDimensionLink>();
     var factSet = new HashSet<string>(schema.Facts, StringComparer.OrdinalIgnoreCase);
@@ -18,10 +18,6 @@ public static class FactRelationResolver
         .Select(t => (t.FactTable, t.OriginalColumn))
         .ToHashSet();
 
-    // Regroupe toutes les relations candidates par paire (FactTable, DimensionTable),
-    // pour ne garder qu'UNE SEULE FK par dimension liée à un fait donné, même si
-    // plusieurs ConfirmedRelations coïncident entre les deux tables (ex: colonnes
-    // dupliquées par coïncidence de nom comme UnitPrice, qui ne sont pas de vraies clés).
     var candidatesByPair = new Dictionary<(string Fact, string Dim), List<(string NaturalKeyColumn, string DimNaturalKeyColumn)>>();
 
     foreach (var rel in schema.ConfirmedRelations)
@@ -30,7 +26,7 @@ public static class FactRelationResolver
         var bIsFact = factSet.Contains(rel.TableB);
 
         if (!aIsFact && !bIsFact) continue;
-        if (aIsFact && bIsFact) continue; // relation fait <-> fait, non gérée ici
+        if (aIsFact && bIsFact) continue;
 
         string factTable, naturalKeyColumn, dimensionTable, dimensionNaturalKeyColumn;
 
@@ -52,6 +48,20 @@ public static class FactRelationResolver
         if (handledByTimeTransform.Contains((factTable, naturalKeyColumn))) continue;
         if (dimensionTable.Contains("DimTemps", StringComparison.OrdinalIgnoreCase)) continue;
 
+        // ✅ NOUVEAU : si la colonne cible a été normalisée dans une sous-dimension
+        // (ex: SalesTerritory.SalesTerritoryCountry -> DimSalesTerritoryCountry),
+        // la colonne n'existe plus sur la table dimension elle-même. On redirige
+        // le lien directement vers la sous-dimension, seule à porter réellement cette donnée.
+        var subDim = schema.SubDimensions.FirstOrDefault(sd =>
+            sd.ParentDimension.Equals(dimensionTable, StringComparison.OrdinalIgnoreCase) &&
+            sd.SourceColumn.Equals(dimensionNaturalKeyColumn, StringComparison.OrdinalIgnoreCase));
+
+        if (subDim != null)
+        {
+            dimensionTable = subDim.Name;
+            // dimensionNaturalKeyColumn reste le même nom (la sous-dimension garde sourceColumn tel quel)
+        }
+
         var pairKey = (factTable, dimensionTable);
         if (!candidatesByPair.TryGetValue(pairKey, out var list))
         {
@@ -61,23 +71,24 @@ public static class FactRelationResolver
         list.Add((naturalKeyColumn, dimensionNaturalKeyColumn));
     }
 
-   foreach (var ((factTable, dimensionTable), candidates) in candidatesByPair)
-{
-    var best = candidates
-        .OrderByDescending(c => c.NaturalKeyColumn.EndsWith("Key", StringComparison.OrdinalIgnoreCase)
-                              || c.NaturalKeyColumn.EndsWith("Id", StringComparison.OrdinalIgnoreCase))
-        .First();
-
-    links.Add(new FactDimensionLink
+    foreach (var ((factTable, dimensionTable), candidates) in candidatesByPair)
     {
-        FactTable = factTable,
-        NaturalKeyColumn = best.NaturalKeyColumn,
-        DimensionTable = dimensionTable,
-        DimensionNaturalKeyColumn = best.DimNaturalKeyColumn,  // ← corrigé ici
-        DimensionSurrogateKeyColumn = GetPrimaryKeyColumnName(dimensionTable, schema),
-        NewFactColumnName = $"{dimensionTable}Id",
-    });
-}
+        var best = candidates
+            .OrderByDescending(c => c.NaturalKeyColumn.EndsWith("Key", StringComparison.OrdinalIgnoreCase)
+                                  || c.NaturalKeyColumn.EndsWith("Id", StringComparison.OrdinalIgnoreCase))
+            .First();
+
+        links.Add(new FactDimensionLink
+        {
+            FactTable = factTable,
+            NaturalKeyColumn = best.NaturalKeyColumn,
+            DimensionTable = dimensionTable,
+            DimensionNaturalKeyColumn = best.DimNaturalKeyColumn,
+            DimensionSurrogateKeyColumn = GetPrimaryKeyColumnName(dimensionTable, schema),
+            NewFactColumnName = $"{dimensionTable}Id",
+        });
+    }
+
     return links;
 }
 

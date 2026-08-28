@@ -95,6 +95,41 @@
       <button type="button" class="btn btn-success" (click)="validateSchema()">
         ✓ Valider ce schéma définitivement
       </button>
+
+      <!-- Confirmation de génération du DW -->
+<div class="card mt-3 border-primary" *ngIf="showDeployConfirm">
+  <div class="card-body">
+    <h6 class="card-title">Générer le Data Warehouse maintenant ?</h6>
+    <p class="text-muted small">Le schéma vient d'être validé. Veux-tu créer et peupler le Data Warehouse correspondant ?</p>
+    <div class="mb-3">
+      <label class="form-label">Nom de la base DW</label>
+      <input type="text" class="form-control" [(ngModel)]="dwDatabaseName" />
+    </div>
+    <button type="button" class="btn btn-primary me-2" (click)="confirmDeploy()">Oui, générer</button>
+    <button type="button" class="btn btn-outline-secondary" (click)="cancelDeploy()">Pas maintenant</button>
+  </div>
+</div>
+
+<!-- État de génération en cours -->
+<div class="text-center py-3" *ngIf="isDeploying">
+  <div class="spinner-border text-primary"></div>
+  <p class="mt-2 text-muted">Génération du Data Warehouse en cours (DDL → ETL → Modèle Tabular)... cela peut prendre jusqu'à une minute.</p>
+</div>
+
+<!-- Résultat de la génération -->
+<div class="card mt-3" *ngIf="deployResult">
+  <div class="card-body">
+    <h6 class="card-title" [ngClass]="deployResult.success ? 'text-success' : 'text-danger'">
+      {{ deployResult.success ? '✓ Data Warehouse généré avec succès' : '✗ Échec de la génération' }}
+    </h6>
+    <ul class="list-unstyled small mb-0">
+      <li>DDL : {{ deployResult.ddl?.success ? '✓' : '✗' }} ({{ deployResult.ddl?.createdTables?.length ?? 0 }} tables créées)</li>
+      <li>ETL : {{ deployResult.etl?.success ? '✓' : '✗' }} ({{ deployResult.etl?.tables?.length ?? 0 }} tables peuplées)</li>
+      <li>Modèle Tabular : {{ deployResult.tabular?.success ? '✓' : '✗' }} ({{ deployResult.tabular?.createdMeasures?.length ?? 0 }} mesures créées)</li>
+    </ul>
+  </div>
+</div>
+
     </div>
 
     <!-- Chat -->

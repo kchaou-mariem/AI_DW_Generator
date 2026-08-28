@@ -42,12 +42,17 @@ interface SchemaState {
   imports: [CommonModule, FormsModule],
   templateUrl: './schema-page.html',
   styleUrl: './schema-page.scss',
+  
 })
 export class SchemaPageComponent implements OnInit {
   database = '';
   sessionId = 0;
   schema: AiSchemaProposal | null = null;
   mode: 'generate' | 'validated' = 'generate';
+  isDeploying = false;
+  deployResult: any = null;
+  showDeployConfirm = false;
+  dwDatabaseName = '';
 
   diagramBoxes: DiagramBox[] = [];
   diagramLines: DiagramLine[] = [];
@@ -238,18 +243,58 @@ viewState(state: SchemaState): void {
 
   // ---- Valider l'état actuellement affiché ----
   validateSchema(): void {
-    if (!this.schema) return;
-    this.aiService.validateSchema(this.database, this.schema).subscribe({
-      next: () => {
-        this.validatedStepNumber = this.currentStepNumber;
-        this.cdr.detectChanges();
-      },
-      error: (err) => {
-        this.errorMessage = 'Erreur validation : ' + (err.error?.message ?? err.message);
-        this.cdr.detectChanges();
-      },
-    });
+  if (!this.schema) return;
+
+  this.aiService.validateSchema(this.database, this.schema).subscribe({
+    next: () => {
+      this.validatedStepNumber = this.currentStepNumber;
+      // Propose un nom de DW par défaut, basé sur la base staging
+      this.dwDatabaseName = `DW_${this.database}`;
+      this.showDeployConfirm = true;
+      this.cdr.detectChanges();
+    },
+    error: (err) => {
+      this.errorMessage = 'Erreur validation : ' + (err.error?.message ?? err.message);
+      this.cdr.detectChanges();
+    },
+  });
+}
+
+
+confirmDeploy(): void {
+  if (!this.dwDatabaseName.trim()) {
+    this.errorMessage = 'Le nom de la base DW est requis.';
+    this.cdr.detectChanges();
+    return;
   }
+
+  this.isDeploying = true;
+  this.showDeployConfirm = false;
+  this.deployResult = null;
+  this.errorMessage = '';
+  this.cdr.detectChanges();
+
+  this.aiService.deployDataWarehouse(this.database, this.dwDatabaseName.trim()).subscribe({
+    next: (result) => {
+      this.deployResult = result;
+      this.isDeploying = false;
+      if (!result.success) {
+        this.errorMessage = `Échec à l'étape "${result.stoppedAtStep}". Vérifie les détails ci-dessous.`;
+      }
+      this.cdr.detectChanges();
+    },
+    error: (err) => {
+      this.errorMessage = 'Erreur lors de la génération du Data Warehouse : ' + (err.error?.message ?? err.message);
+      this.isDeploying = false;
+      this.cdr.detectChanges();
+    },
+  });
+}
+
+cancelDeploy(): void {
+  this.showDeployConfirm = false;
+  this.cdr.detectChanges();
+}
 
   // ---- Nouveau : valider un état précis depuis le panneau, sans y naviguer d'abord ----
   validateState(state: SchemaState): void {
