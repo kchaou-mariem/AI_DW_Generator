@@ -1,10 +1,10 @@
-import { Component, OnInit, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
 import { AiService } from '../../../core/services/ai.service';
 import { AiSchemaProposal } from '../../../core/models/schema.model';
-
+import { Component, OnInit, ChangeDetectorRef, ViewChild, ElementRef } from '@angular/core';
+import { jsPDF } from 'jspdf';
 interface DiagramBox {
   id: string;
   label: string;
@@ -79,6 +79,61 @@ export class SchemaPageComponent implements OnInit {
     private aiService: AiService,
     private cdr: ChangeDetectorRef,
   ) {}
+
+@ViewChild('diagramSvg') diagramSvgRef!: ElementRef<SVGSVGElement>;
+isExportingPdf = false;
+exportDiagramToPdf(): void {
+  const svgEl = this.diagramSvgRef?.nativeElement;
+  if (!svgEl) return;
+
+  this.isExportingPdf = true;
+  this.cdr.detectChanges();
+
+  const svgData = new XMLSerializer().serializeToString(svgEl);
+  const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
+  const url = URL.createObjectURL(svgBlob);
+
+  const img = new Image();
+  img.onload = () => {
+    const scale = 2; // meilleure résolution
+    const canvas = document.createElement('canvas');
+    canvas.width = this.diagramWidth * scale;
+    canvas.height = this.diagramHeight * scale;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      this.isExportingPdf = false;
+      this.cdr.detectChanges();
+      return;
+    }
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0, this.diagramWidth, this.diagramHeight);
+
+    URL.revokeObjectURL(url);
+
+    const pngDataUrl = canvas.toDataURL('image/png');
+
+    const orientation = this.diagramWidth > this.diagramHeight ? 'l' : 'p';
+    const pdf = new jsPDF({ orientation, unit: 'px', format: [canvas.width, canvas.height] });
+    pdf.addImage(pngDataUrl, 'PNG', 0, 0, canvas.width, canvas.height);
+    pdf.save(`schema-${this.database}.pdf`);
+
+    this.isExportingPdf = false;
+    this.cdr.detectChanges();
+  };
+
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    this.errorMessage = "Erreur lors de l'export PDF.";
+    this.isExportingPdf = false;
+    this.cdr.detectChanges();
+  };
+
+  img.src = url;
+}
 
   ngOnInit(): void {
     this.database = this.route.snapshot.paramMap.get('database') ?? '';

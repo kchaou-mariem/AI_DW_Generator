@@ -1,0 +1,17 @@
+<nav class="app-header">
+  <div class="app-header__inner">
+    <a routerLink="/upload" class="app-header__brand">
+      <i class="bi bi-diagram-3-fill"></i>
+      <span>DW Generator</span>
+    </a>
+
+    <div class="app-header__links">
+      <a routerLink="/upload" routerLinkActive="active" class="app-header__link">
+        <i class="bi bi-cloud-upload"></i> Upload
+      </a>
+      <a *ngIf="currentDatabase" [routerLink]="['/schema', currentDatabase]" routerLinkActive="active" class="app-header__link">
+        <i class="bi bi-diagram-2"></i> Schéma — {{ currentDatabase }}
+      </a>
+    </div>
+  </div>
+</nav>

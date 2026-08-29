@@ -42,9 +42,21 @@
         </div>
       </div>
 
-      <div class="card mb-3">
-        <div class="card-body p-0" style="overflow: auto; max-height: 600px;">
-          <svg [attr.width]="diagramWidth" [attr.height]="diagramHeight" [attr.viewBox]="'0 0 ' + diagramWidth + ' ' + diagramHeight">
+<div class="card mb-3 position-relative">
+  <button
+    type="button"
+    class="btn btn-sm btn-light border shadow-sm position-absolute"
+    style="top: 12px; right: 24px; z-index: 10; border-radius: 6px;"
+    title="Télécharger le diagramme en PDF"
+    (click)="exportDiagramToPdf()"
+    [disabled]="isExportingPdf"
+  >
+    <span *ngIf="isExportingPdf" class="spinner-border spinner-border-sm"></span>
+    <i *ngIf="!isExportingPdf" class="bi bi-file-earmark-pdf"></i>
+  </button>
+
+  <div class="card-body p-0" style="overflow: auto; max-height: 600px;">
+    <svg #diagramSvg [attr.width]="diagramWidth" [attr.height]="diagramHeight" [attr.viewBox]="'0 0 ' + diagramWidth + ' ' + diagramHeight">
             <defs>
               <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                 <path d="M0,0 L8,4 L0,8 Z" fill="#888" />

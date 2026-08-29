@@ -1,1 +1,53 @@
-/* You can add global styles to this file, and also import other style files */
+:root {
+  --color-primary: #0d6efd;
+  --color-primary-dark: #0b5ed7;
+  --color-accent: #38bdf8;
+  --color-success: #16a34a;
+  --color-danger: #dc2626;
+  --color-surface: #ffffff;
+  --color-bg: #f8fafc;
+  --color-text: #1e293b;
+  --color-text-muted: #64748b;
+  --radius: 10px;
+}
+
+body {
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+  color: var(--color-text);
+  background-color: var(--color-bg);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.card {
+  border: none;
+  border-radius: var(--radius);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: box-shadow 0.15s ease;
+
+  &:hover {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  }
+}
+
+.btn {
+  border-radius: 8px;
+  font-weight: 500;
+  padding: 0.5rem 1.1rem;
+}
+
+.btn-success {
+  background-color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.form-control, .form-select {
+  border-radius: 8px;
+}
+
+.container, .container-fluid {
+  max-width: 1280px;
+}
