@@ -7,7 +7,7 @@ import { map, catchError } from 'rxjs/operators';
 import { UploadService } from '../../../core/services/upload.service';
 import { AiService } from '../../../core/services/ai.service';
 import { UploadResponse } from '../../../core/models/schema.model';
-
+import { ToastService } from '../../../core/services/toast.service';
 interface DatabaseStatus {
   hasValidatedSchema: boolean;
   hasStagingTables: boolean;
@@ -42,6 +42,7 @@ export class UploadPageComponent implements OnInit {
     private aiService: AiService,
     private router: Router,
     private cdr: ChangeDetectorRef,
+    private toastService: ToastService,
   ) {}
 
   ngOnInit(): void {
@@ -164,21 +165,29 @@ export class UploadPageComponent implements OnInit {
     this.uploadResult = null;
     this.cdr.detectChanges();
 
-    this.uploadService.uploadFiles(database, this.selectedFiles).subscribe({
-      next: (result) => {
-        this.uploadResult = result;
-      },
-      error: (err) => {
-        this.errorMessage = "Erreur lors de l'upload : " + (err.error?.message ?? err.message);
-        this.isUploading = false;
-        this.cdr.detectChanges();
-      },
-      complete: () => {
-        this.isUploading = false;
-        this.cdr.detectChanges();
-      },
-    });
-  }
+     this.uploadService.uploadFiles(database, this.selectedFiles).subscribe({
+    next: (result) => {
+      this.uploadResult = result;
+      const successCount = result.files.filter((f) => f.success).length;
+      const failCount = result.files.length - successCount;
+      if (failCount === 0) {
+        this.toastService.show(`${successCount} fichier(s) importé(s) avec succès.`, 'success');
+      } else {
+        this.toastService.show(`${successCount} réussi(s), ${failCount} échoué(s).`, 'danger');
+      }
+    },
+    error: (err) => {
+      this.errorMessage = "Erreur lors de l'upload : " + (err.error?.message ?? err.message);
+      this.toastService.show("Erreur lors de l'upload.", 'danger');
+      this.isUploading = false;
+      this.cdr.detectChanges();
+    },
+    complete: () => {
+      this.isUploading = false;
+      this.cdr.detectChanges();
+    },
+  });
+}
 
   goToSchemaGeneration(): void {
     this.router.navigate(['/schema', this.selectedDatabase], { queryParams: { mode: 'generate' } });

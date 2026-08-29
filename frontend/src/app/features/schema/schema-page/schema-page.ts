@@ -5,6 +5,8 @@ import { AiService } from '../../../core/services/ai.service';
 import { AiSchemaProposal } from '../../../core/models/schema.model';
 import { Component, OnInit, ChangeDetectorRef, ViewChild, ElementRef } from '@angular/core';
 import { jsPDF } from 'jspdf';
+import { ToastService } from '../../../core/services/toast.service';
+
 interface DiagramBox {
   id: string;
   label: string;
@@ -78,6 +80,7 @@ export class SchemaPageComponent implements OnInit {
     private router: Router,
     private aiService: AiService,
     private cdr: ChangeDetectorRef,
+    private toastService: ToastService,
   ) {}
 
 @ViewChild('diagramSvg') diagramSvgRef!: ElementRef<SVGSVGElement>;
@@ -330,20 +333,24 @@ confirmDeploy(): void {
   this.cdr.detectChanges();
 
   this.aiService.deployDataWarehouse(this.database, this.dwDatabaseName.trim()).subscribe({
-    next: (result) => {
-      this.deployResult = result;
-      this.isDeploying = false;
-      if (!result.success) {
-        this.errorMessage = `Échec à l'étape "${result.stoppedAtStep}". Vérifie les détails ci-dessous.`;
-      }
-      this.cdr.detectChanges();
-    },
-    error: (err) => {
-      this.errorMessage = 'Erreur lors de la génération du Data Warehouse : ' + (err.error?.message ?? err.message);
-      this.isDeploying = false;
-      this.cdr.detectChanges();
-    },
-  });
+  next: (result) => {
+    this.deployResult = result;
+    this.isDeploying = false;
+    if (result.success) {
+      this.toastService.show('Data Warehouse généré avec succès !', 'success');
+    } else {
+      this.errorMessage = `Échec à l'étape "${result.stoppedAtStep}". Vérifie les détails ci-dessous.`;
+      this.toastService.show(`Échec de la génération (étape: ${result.stoppedAtStep}).`, 'danger');
+    }
+    this.cdr.detectChanges();
+  },
+  error: (err) => {
+    this.errorMessage = 'Erreur lors de la génération du Data Warehouse : ' + (err.error?.message ?? err.message);
+    this.toastService.show('Erreur lors de la génération du Data Warehouse.', 'danger');
+    this.isDeploying = false;
+    this.cdr.detectChanges();
+  },
+});
 }
 
 cancelDeploy(): void {

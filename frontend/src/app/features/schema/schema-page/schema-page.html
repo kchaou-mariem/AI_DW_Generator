@@ -109,16 +109,18 @@
       </button>
 
       <!-- Confirmation de génération du DW -->
-<div class="card mt-3 border-primary" *ngIf="showDeployConfirm">
-  <div class="card-body">
-    <h6 class="card-title">Générer le Data Warehouse maintenant ?</h6>
-    <p class="text-muted small">Le schéma vient d'être validé. Veux-tu créer et peupler le Data Warehouse correspondant ?</p>
+<div class="app-modal-backdrop" *ngIf="showDeployConfirm" (click)="cancelDeploy()">
+  <div class="app-modal" (click)="$event.stopPropagation()">
+    <h5 class="mb-2">🚀 Générer le Data Warehouse ?</h5>
+    <p class="text-muted small mb-3">Le schéma vient d'être validé. Crée et peuple le Data Warehouse correspondant maintenant ?</p>
     <div class="mb-3">
       <label class="form-label">Nom de la base DW</label>
-      <input type="text" class="form-control" [(ngModel)]="dwDatabaseName" />
+      <input type="text" class="form-control" [(ngModel)]="dwDatabaseName" autofocus />
     </div>
-    <button type="button" class="btn btn-primary me-2" (click)="confirmDeploy()">Oui, générer</button>
-    <button type="button" class="btn btn-outline-secondary" (click)="cancelDeploy()">Pas maintenant</button>
+    <div class="d-flex justify-content-end gap-2">
+      <button type="button" class="btn btn-outline-secondary" (click)="cancelDeploy()">Pas maintenant</button>
+      <button type="button" class="btn btn-primary" (click)="confirmDeploy()">✓ Générer</button>
+    </div>
   </div>
 </div>
 

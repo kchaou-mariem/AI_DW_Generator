@@ -1,0 +1,7 @@
+<div class="app-toast-container">
+  <div *ngFor="let toast of toastService.toasts()" class="app-toast" [ngClass]="'toast-' + toast.type">
+    <i class="bi" [ngClass]="iconFor(toast.type)"></i>
+    <div class="flex-grow-1">{{ toast.message }}</div>
+    <button type="button" class="btn-close btn-sm" (click)="toastService.dismiss(toast.id)"></button>
+  </div>
+</div>
