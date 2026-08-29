@@ -52,12 +52,19 @@ async chatModifySchema(
   @Body('currentSchema') currentSchema: unknown,
 ) {
   let schemaToUse = currentSchema;
+  const history = await this.uploadService.getChatHistory(database, sessionId);
   if (!schemaToUse) {
-    const history = await this.uploadService.getChatHistory(database, sessionId);
-    schemaToUse = history[history.length - 1].schema; // fallback si rien n'est fourni
+    schemaToUse = history[history.length - 1].schema;
   }
 
-  const result = await this.aiService.applyChatModification(database, schemaToUse, message);
+  // ✅ NOUVEAU : les 3 derniers échanges (message utilisateur + explication IA),
+  // pour que le modèle comprenne les références type "aussi", "pourquoi pas", etc.
+  const recentExchanges = history
+    .slice(-3)
+    .filter((h: any) => h.userMessage)
+    .map((h: any) => ({ user: h.userMessage, ai: h.aiExplanation }));
+
+  const result = await this.aiService.applyChatModification(database, schemaToUse, message, recentExchanges);
 
   if (!result.schemaChanged) {
     // ✅ Simple question / aucune modification réelle : pas de nouvel état créé

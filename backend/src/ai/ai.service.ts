@@ -1758,27 +1758,283 @@ private validateAndClean(
     warnings,
   };
 }
-private buildChatPrompt(currentSchema: any, userMessage: string): string {
-  return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
+// private buildChatPrompt(currentSchema: any, userMessage: string): string {
+//   return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
 
-Schéma actuel :
-${JSON.stringify({ dimensions: currentSchema.dimensions, facts: currentSchema.facts, confirmedRelations: currentSchema.confirmedRelations, subDimensions: currentSchema.subDimensions, tableAttributes: currentSchema.tableAttributes })}
+// Schéma actuel :
+// ${JSON.stringify({ dimensions: currentSchema.dimensions, facts: currentSchema.facts, confirmedRelations: currentSchema.confirmedRelations, subDimensions: currentSchema.subDimensions, tableAttributes: currentSchema.tableAttributes })}
 
-Message de l'utilisateur : "${userMessage}"
+// Message de l'utilisateur : "${userMessage}"
 
-Réponds à sa question ou sa demande de façon naturelle et utile, en français.
+// Réponds à sa question ou sa demande de façon naturelle et utile, en français.
 
-⚠️ IMPORTANT : détermine d'abord si le message est une SIMPLE QUESTION (ne demande aucune modification, juste une explication) ou une DEMANDE DE MODIFICATION explicite (déplacer une table, ajouter/retirer une relation).
+// ⚠️ IMPORTANT : détermine d'abord si le message est une SIMPLE QUESTION (ne demande aucune modification, juste une explication) ou une DEMANDE DE MODIFICATION explicite (déplacer une table, ajouter/retirer une relation).
 
-- Si c'est une SIMPLE QUESTION : mets "schemaChanged": false, et NE RENVOIE PAS les champs "dimensions"/"facts"/"confirmedRelations" (laisse-les absents ou vides).
-- Si c'est une DEMANDE DE MODIFICATION : applique-la en respectant ces règles, mets "schemaChanged": true, et renvoie les champs complets et mis à jour :
-  - INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
-  - Le schéma peut avoir PLUSIEURS tables de faits (constellation) si l'utilisateur le demande — dans ce cas, veille à ce qu'au moins une dimension reste reliée aux différentes tables de faits.
-  - N'invente jamais de nom de table ou de colonne qui n'existe pas déjà dans le schéma actuel ou les métadonnées d'origine.
-  - Ne modifie jamais "DimTemps" ni ses relations — cette dimension est gérée automatiquement, ignore toute demande à son sujet et explique-le à l'utilisateur si besoin.
+// - Si c'est une SIMPLE QUESTION : mets "schemaChanged": false, et NE RENVOIE PAS les champs "dimensions"/"facts"/"confirmedRelations" (laisse-les absents ou vides).
+// - Si c'est une DEMANDE DE MODIFICATION : applique-la en respectant ces règles, mets "schemaChanged": true, et renvoie les champs complets et mis à jour :
+//   - INTERDIT : ne propose jamais de relation directe entre deux dimensions qui sont TOUTES LES DEUX déjà reliées directement à une table de faits.
+//   - Le schéma peut avoir PLUSIEURS tables de faits (constellation) si l'utilisateur le demande — dans ce cas, veille à ce qu'au moins une dimension reste reliée aux différentes tables de faits.
+//   - N'invente jamais de nom de table ou de colonne qui n'existe pas déjà dans le schéma actuel ou les métadonnées d'origine.
+//   - Ne modifie jamais "DimTemps" ni ses relations — cette dimension est gérée automatiquement, ignore toute demande à son sujet et explique-le à l'utilisateur si besoin.
 
-Réponds STRICTEMENT en JSON avec ce format :
-{"reply":"ta réponse conversationnelle à l'utilisateur","schemaChanged":false,"dimensions":[],"facts":[],"confirmedRelations":[],"subDimensions":[]}`;
+// Réponds STRICTEMENT en JSON avec ce format :
+// {"reply":"ta réponse conversationnelle à l'utilisateur","schemaChanged":false,"dimensions":[],"facts":[],"confirmedRelations":[],"subDimensions":[]}`;
+// }
+private applyChatAction(
+  currentSchema: any,
+  action: any,
+): { newSchema: any; deterministicExplanation: string; changed: boolean } {
+  const schema = JSON.parse(JSON.stringify(currentSchema)); // clone profond, on ne touche rien d'autre
+
+  switch (action.action) {
+    case 'none': {
+      return { newSchema: schema, deterministicExplanation: '', changed: false };
+    }
+
+    case 'move_to_fact': {
+      const table = action.table;
+      if (!schema.dimensions?.includes(table)) {
+        return { newSchema: schema, deterministicExplanation: `Table "${table}" introuvable en dimension, aucun changement.`, changed: false };
+      }
+      schema.dimensions = schema.dimensions.filter((t: string) => t !== table);
+      schema.facts = [...(schema.facts ?? []), table];
+      return { newSchema: schema, deterministicExplanation: `${table} déplacée de dimension vers fait.`, changed: true };
+    }
+
+    case 'move_to_dimension': {
+      const table = action.table;
+      if (!schema.facts?.includes(table)) {
+        return { newSchema: schema, deterministicExplanation: `Table "${table}" introuvable en fait, aucun changement.`, changed: false };
+      }
+      schema.facts = schema.facts.filter((t: string) => t !== table);
+      schema.dimensions = [...(schema.dimensions ?? []), table];
+      return { newSchema: schema, deterministicExplanation: `${table} déplacée de fait vers dimension.`, changed: true };
+    }
+
+    case 'remove_dimension': {
+  const table = action.table;
+  if (!schema.dimensions?.includes(table)) {
+    return { newSchema: schema, deterministicExplanation: `Table "${table}" introuvable en dimension, aucun changement.`, changed: false };
+  }
+
+  schema.dimensions = schema.dimensions.filter((t: string) => t !== table);
+
+  const removedRelationsCount = (schema.confirmedRelations ?? []).filter(
+    (r: any) => r.tableA === table || r.tableB === table,
+  ).length;
+  schema.confirmedRelations = (schema.confirmedRelations ?? []).filter(
+    (r: any) => r.tableA !== table && r.tableB !== table,
+  );
+
+  const orphanedSubDims = (schema.subDimensions ?? []).filter((sd: any) => sd.parentDimension === table);
+  schema.subDimensions = (schema.subDimensions ?? []).filter((sd: any) => sd.parentDimension !== table);
+
+  let explanation = `${table} retirée du Data Warehouse (renvoyée en staging non classé).`;
+  if (removedRelationsCount > 0) explanation += ` ${removedRelationsCount} relation(s) supprimée(s).`;
+  if (orphanedSubDims.length > 0) {
+    explanation += ` ${orphanedSubDims.length} sous-dimension(s) orpheline(s) également retirée(s) : ${orphanedSubDims.map((sd: any) => sd.name).join(', ')}.`;
+  }
+
+  return { newSchema: schema, deterministicExplanation: explanation, changed: true };
+}
+
+case 'remove_fact': {
+  const table = action.table;
+  if (!schema.facts?.includes(table)) {
+    return { newSchema: schema, deterministicExplanation: `Table "${table}" introuvable en fait, aucun changement.`, changed: false };
+  }
+
+  schema.facts = schema.facts.filter((t: string) => t !== table);
+
+  const removedRelationsCount = (schema.confirmedRelations ?? []).filter(
+    (r: any) => r.tableA === table || r.tableB === table,
+  ).length;
+  schema.confirmedRelations = (schema.confirmedRelations ?? []).filter(
+    (r: any) => r.tableA !== table && r.tableB !== table,
+  );
+
+  // Purge les transformations DimTemps liées à ce fait
+  const removedTransformationsCount = (schema.factColumnTransformations ?? []).filter(
+    (t: any) => t.factTable === table,
+  ).length;
+  schema.factColumnTransformations = (schema.factColumnTransformations ?? []).filter(
+    (t: any) => t.factTable !== table,
+  );
+
+  const dimTempsStillUsed = (schema.factColumnTransformations ?? []).some(
+    (t: any) => t.referencesTable === 'DimTemps',
+  );
+  let dimTempsRemoved = false;
+  if (!dimTempsStillUsed && schema.generatedDimensions?.some((gd: any) => gd.name === 'DimTemps')) {
+    schema.generatedDimensions = schema.generatedDimensions.filter((gd: any) => gd.name !== 'DimTemps');
+    schema.dimensions = (schema.dimensions ?? []).filter((d: string) => !d.toLowerCase().includes('dimtemps'));
+    dimTempsRemoved = true;
+  }
+
+  // ✅ NOUVEAU : retire les dimensions restantes qui n'ont plus AUCUNE relation avec un fait
+  // (elles étaient liées uniquement au fait qu'on vient de supprimer).
+  const remainingFacts = new Set(schema.facts ?? []);
+  const orphanedDimensions = (schema.dimensions ?? []).filter((dim: string) => {
+    const hasRelationToAnyFact = (schema.confirmedRelations ?? []).some(
+      (r: any) =>
+        (r.tableA === dim && remainingFacts.has(r.tableB)) ||
+        (r.tableB === dim && remainingFacts.has(r.tableA)),
+    );
+    return !hasRelationToAnyFact;
+  });
+
+  let orphanCascadeExplanation = '';
+  for (const orphanTable of orphanedDimensions) {
+    schema.dimensions = schema.dimensions.filter((t: string) => t !== orphanTable);
+    schema.confirmedRelations = (schema.confirmedRelations ?? []).filter(
+      (r: any) => r.tableA !== orphanTable && r.tableB !== orphanTable,
+    );
+    const orphanedSubDims = (schema.subDimensions ?? []).filter((sd: any) => sd.parentDimension === orphanTable);
+    schema.subDimensions = (schema.subDimensions ?? []).filter((sd: any) => sd.parentDimension !== orphanTable);
+    if (orphanedSubDims.length > 0) {
+      orphanCascadeExplanation += ` ${orphanTable} et ses sous-dimension(s) (${orphanedSubDims.map((sd: any) => sd.name).join(', ')}) retirée(s) car sans relation restante.`;
+    } else {
+      orphanCascadeExplanation += ` ${orphanTable} retirée car sans relation restante.`;
+    }
+  }
+
+  let explanation = `${table} retirée du Data Warehouse.`;
+  if (removedRelationsCount > 0) explanation += ` ${removedRelationsCount} relation(s) supprimée(s).`;
+  if (removedTransformationsCount > 0) explanation += ` ${removedTransformationsCount} transformation(s) de date supprimée(s).`;
+  if (dimTempsRemoved) explanation += ` DimTemps retirée (plus aucun fait ne l'utilise).`;
+  if (orphanCascadeExplanation) explanation += orphanCascadeExplanation;
+
+  return { newSchema: schema, deterministicExplanation: explanation, changed: true };
+}
+    case 'add_relation': {
+      const exists = (schema.confirmedRelations ?? []).some(
+        (r: any) => r.tableA === action.tableA && r.columnA === action.columnA && r.tableB === action.tableB && r.columnB === action.columnB,
+      );
+      if (exists) {
+        return { newSchema: schema, deterministicExplanation: 'Cette relation existe déjà.', changed: false };
+      }
+      schema.confirmedRelations = [
+        ...(schema.confirmedRelations ?? []),
+        { tableA: action.tableA, columnA: action.columnA, tableB: action.tableB, columnB: action.columnB, reason: 'ajoutee_via_chat' },
+      ];
+      return { newSchema: schema, deterministicExplanation: `Relation ajoutée : ${action.tableA}.${action.columnA} ↔ ${action.tableB}.${action.columnB}.`, changed: true };
+    }
+
+    case 'remove_relation': {
+      const before = (schema.confirmedRelations ?? []).length;
+      schema.confirmedRelations = (schema.confirmedRelations ?? []).filter(
+        (r: any) => !(r.tableA === action.tableA && r.columnA === action.columnA && r.tableB === action.tableB && r.columnB === action.columnB),
+      );
+      const changed = schema.confirmedRelations.length !== before;
+      return {
+        newSchema: schema,
+        deterministicExplanation: changed ? `Relation supprimée : ${action.tableA}.${action.columnA} ↔ ${action.tableB}.${action.columnB}.` : 'Relation introuvable, aucun changement.',
+        changed,
+      };
+    }
+
+    case 'remove_subdimension': {
+      const before = (schema.subDimensions ?? []).length;
+      schema.subDimensions = (schema.subDimensions ?? []).filter((sd: any) => sd.name !== action.name);
+      const changed = schema.subDimensions.length !== before;
+      return {
+        newSchema: schema,
+        deterministicExplanation: changed ? `Sous-dimension ${action.name} supprimée.` : 'Sous-dimension introuvable, aucun changement.',
+        changed,
+      };
+    }
+
+    default:
+      return { newSchema: schema, deterministicExplanation: '', changed: false };
+  }
+}
+
+// private buildChatPrompt(currentSchema: any, userMessage: string): string {
+//   const dims = (currentSchema.dimensions ?? []).join(', ');
+//   const facts = (currentSchema.facts ?? []).join(', ');
+//   const relations = (currentSchema.confirmedRelations ?? [])
+//     .map((r: any) => `${r.tableA}.${r.columnA}-${r.tableB}.${r.columnB}`)
+//     .join('; ');
+//   const subDims = (currentSchema.subDimensions ?? [])
+//     .map((sd: any) => `${sd.name}(from ${sd.parentDimension}.${sd.sourceColumn})`)
+//     .join('; ');
+
+//   return `You manage a data warehouse schema. Current state:
+// Dimensions: ${dims || 'none'}
+// Facts: ${facts || 'none'}
+// Relations: ${relations || 'none'}
+// Sub-dimensions: ${subDims || 'none'}
+
+// User request: "${userMessage}"
+
+// Pick EXACTLY ONE action that matches the request. Do NOT modify anything not explicitly asked.
+
+// Available actions:
+// - {"action":"none","reply":"..."} — if it's just a question, no change needed
+// - {"action":"move_to_fact","table":"TableName","reply":"..."}
+// - {"action":"move_to_dimension","table":"TableName","reply":"..."}
+// - {"action":"remove_dimension","table":"TableName","reply":"..."} — completely remove a dimension from the DW (it goes back to unclassified staging)
+// - {"action":"remove_fact","table":"TableName","reply":"..."} — completely remove a fact table from the DW
+// - {"action":"add_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
+// - {"action":"remove_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
+// - {"action":"remove_subdimension","name":"DimX","reply":"..."}
+// - {"action":"unsupported","reply":"explain why this request cannot be applied"}
+
+// Rules:
+// - "table" must be an EXACT name from the lists above.
+// - Never touch "DimTemps" or its relations — reply "unsupported" if asked.
+// - "reply" is a short, natural sentence in French explaining what you are doing (or why not).
+
+// ⚠️ Reply ONLY with valid JSON for ONE action, nothing else.`;
+// }
+
+private buildChatPrompt(currentSchema: any, userMessage: string, recentExchanges: { user: string; ai: string }[] = []): string {
+  const historyBlock = this.formatRecentHistory(recentExchanges);
+  const dims = (currentSchema.dimensions ?? []).join(', ');
+  const facts = (currentSchema.facts ?? []).join(', ');
+  const relations = (currentSchema.confirmedRelations ?? [])
+    .map((r: any) => `${r.tableA}.${r.columnA}-${r.tableB}.${r.columnB}`)
+    .join('; ');
+  const subDims = (currentSchema.subDimensions ?? [])
+    .map((sd: any) => `${sd.name}(from ${sd.parentDimension}.${sd.sourceColumn})`)
+    .join('; ');
+
+  return `You manage a data warehouse schema. Current state:
+Dimensions: ${dims || 'none'}
+Facts: ${facts || 'none'}
+Relations: ${relations || 'none'}
+Sub-dimensions: ${subDims || 'none'}
+${historyBlock}
+User message: "${userMessage}"
+
+⚠️ STEP 1 — Decide FIRST: is this a QUESTION/GENERAL REQUEST (asking for information, explanation, definition, comparison, opinion) or a MODIFICATION REQUEST (explicitly asking to change/add/remove something in THIS schema)?
+
+If it is a QUESTION or you are not 100% sure it is a modification request targeting an EXISTING element listed above: use {"action":"answer_question","reply":"your answer in French"}.
+
+⚠️ NEVER use "remove_subdimension", "remove_dimension" or "remove_fact" unless the user explicitly names a table/sub-dimension that appears in the lists above, AND clearly asks to remove/delete it.
+
+Examples of what "answer_question" is for (do NOT touch the schema for these):
+- "what is a star schema?" -> answer_question
+- "explain the difference between X and Y" -> answer_question
+- "what do you think about..." -> answer_question
+- "can you turn this into a star schema?" -> answer_question, explain in "reply" that this specific transformation is not supported yet, suggest removing sub-dimensions one by one instead
+
+Available actions for ACTUAL modifications:
+- {"action":"answer_question","reply":"..."}
+- {"action":"move_to_fact","table":"TableName","reply":"..."}
+- {"action":"move_to_dimension","table":"TableName","reply":"..."}
+- {"action":"remove_dimension","table":"TableName","reply":"..."}
+- {"action":"remove_fact","table":"TableName","reply":"..."}
+- {"action":"add_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
+- {"action":"remove_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
+- {"action":"remove_subdimension","name":"DimX","reply":"..."}
+
+Rules:
+- "table"/"name" must be an EXACT name from the lists above. If it does not match exactly, use "answer_question" instead and explain the name was not found.
+- Never touch "DimTemps" or its relations.
+- "reply" is a short, natural sentence in French.
+
+⚠️ Reply ONLY with valid JSON for ONE action, nothing else.`;
 }
 
   private computeDiffExplanation(oldSchema: any, newSchema: any): string {
@@ -1832,10 +2088,167 @@ Réponds STRICTEMENT en JSON avec ce format :
 }
 
 
+// async applyChatModification(
+//   database: string,
+//   currentSchema: any,
+//   userMessage: string,
+// ): Promise<{ updatedSchema: AiSchemaProposal; explanation: string; schemaChanged: boolean }> {
+//   const metadata = await this.getMetadataWithCache(database);
+//   const validTableNames = new Set(metadata.map((cols) => cols[0]?.sourceTable).filter(Boolean));
+//   const validColumnsByTable = new Map<string, Set<string>>();
+//   for (const cols of metadata) {
+//     if (cols.length === 0) continue;
+//     validColumnsByTable.set(cols[0].sourceTable, new Set(cols.map((c) => c.columnName)));
+//   }
+
+//   const internalCurrentSchema = this.restoreInternalNames(currentSchema, validTableNames);
+
+//   const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage);
+
+//   // Nombre max de tables réelles pouvant disparaître en un seul message avant
+//   // de considérer que c'est un oubli du modèle plutôt qu'un retrait volontaire.
+//   const MAX_INTENTIONAL_TABLE_DROP = 2;
+
+//   let lastError: string | null = null;
+//   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
+//     try {
+//       const rawResponse = await this.callOllama(prompt);
+//       const cleaned = rawResponse.replace(/```json|```/g, '').trim();
+//       const parsed = JSON.parse(cleaned);
+
+//       const previousDimensions: string[] = internalCurrentSchema.dimensions ?? [];
+//       const previousFacts: string[] = internalCurrentSchema.facts ?? [];
+//       const previousRealTables = new Set(
+//         [...previousDimensions, ...previousFacts]
+//           .map((t) => this.stripPrefix(t))
+//           .filter((t) => validTableNames.has(t) || validTableNames.has(`staging_${t}`)),
+//       );
+
+//       const proposedDimensions: string[] = Array.isArray(parsed.dimensions) ? parsed.dimensions : [];
+//       const proposedFacts: string[] = Array.isArray(parsed.facts) ? parsed.facts : [];
+//       const proposedRealTables = new Set(
+//         [...proposedDimensions, ...proposedFacts]
+//           .map((t) => this.stripPrefix(t))
+//           .filter((t) => validTableNames.has(t) || validTableNames.has(`staging_${t}`)),
+//       );
+
+//       const droppedTables = [...previousRealTables].filter((t) => !proposedRealTables.has(t));
+//       const dropLooksIntentional =
+//         droppedTables.length > 0 && droppedTables.length <= MAX_INTENTIONAL_TABLE_DROP;
+//       const dropLooksLikeModelError = droppedTables.length > MAX_INTENTIONAL_TABLE_DROP;
+
+//       if (dropLooksLikeModelError) {
+//         console.warn(
+//           `[applyChatModification] ${droppedTables.length} table(s) auraient disparu (${droppedTables.join(', ')}) — probable oubli du modèle, classification conservée telle quelle.`,
+//         );
+//       }
+
+//       const sourceForValidation = parsed.schemaChanged === false
+//         ? internalCurrentSchema
+//         : {
+//             // ✅ On ne fait confiance à la nouvelle classification que si :
+//             //    - le tableau n'est pas vide, ET
+//             //    - la perte de tables reste dans une plage plausible pour une action volontaire
+//             dimensions:
+//               proposedDimensions.length > 0 && !dropLooksLikeModelError
+//                 ? proposedDimensions
+//                 : previousDimensions,
+//             facts:
+//               proposedFacts.length > 0 && !dropLooksLikeModelError
+//                 ? proposedFacts
+//                 : previousFacts,
+//             confirmedRelations: Array.isArray(parsed.confirmedRelations) && parsed.confirmedRelations.length > 0
+//               ? parsed.confirmedRelations
+//               : internalCurrentSchema.confirmedRelations,
+//             // subDimensions PEUT légitimement devenir [] (ex: "retire toutes les sous-dimensions"),
+//             // donc on ne retombe sur l'ancien tableau QUE si le champ est absent (undefined/null).
+//             subDimensions: parsed.subDimensions ?? internalCurrentSchema.subDimensions,
+//           };
+
+//       const validated = this.validateAndClean(
+//         {
+//           dimensions: sourceForValidation.dimensions,
+//           facts: sourceForValidation.facts,
+//           confirmedRelations: sourceForValidation.confirmedRelations,
+//           additionalRelations: [],
+//           subDimensions: sourceForValidation.subDimensions ?? [],
+//         } as any,
+//         validTableNames,
+//         validColumnsByTable,
+//         metadata,
+//         false, // mode chat : ne force pas la ré-ajout d'une table volontairement retirée
+//       );
+
+//       const displayed = this.applyDisplayNames(validated);
+
+//       if (parsed.schemaChanged === false) {
+//         return {
+//           updatedSchema: { ...displayed, rawResponse },
+//           explanation: parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?",
+//           schemaChanged: false,
+//         };
+//       }
+
+//       const diffText = this.computeDiffExplanation(internalCurrentSchema, validated);
+//       const hasRealChange = diffText !== 'Aucun changement détecté dans le schéma';
+
+//       const modelErrorNote = dropLooksLikeModelError
+//         ? `\n\n(Note : ${droppedTables.length} table(s) semblaient disparaître de la classification de façon inattendue — classification d'origine conservée par sécurité, seules les relations/sous-dimensions demandées ont été appliquées.)`
+//         : '';
+
+//       const finalReply =
+//         (hasRealChange
+//           ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
+//           : parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?") + modelErrorNote;
+
+//       return {
+//         updatedSchema: { ...displayed, rawResponse },
+//         explanation: finalReply,
+//         schemaChanged: hasRealChange,
+//       };
+//     } catch (err) {
+//       lastError = err.message;
+//       console.warn(`Chat - tentative ${attempt}/${this.MAX_RETRIES} échouée: ${lastError}`);
+//     }
+//   }
+
+//   throw new InternalServerErrorException(
+//     `L'IA n'a pas réussi à traiter ta demande après ${this.MAX_RETRIES} tentatives. Dernière erreur: ${lastError}`,
+//   );
+// }
+
+private isQuestionAboutCurrentSchema(userMessage: string, schema: any): boolean {
+  const allTableNames = [
+    ...(schema.dimensions ?? []),
+    ...(schema.facts ?? []),
+    ...(schema.subDimensions ?? []).map((sd: any) => sd.name),
+  ].map((t: string) => t.toLowerCase());
+
+  const lowerMessage = userMessage.toLowerCase();
+
+  // Correspondance directe : un nom de table réel est cité
+  if (allTableNames.some((name) => lowerMessage.includes(name))) return true;
+
+  // Référence explicite au schéma/diagramme actuel, même sans citer de nom de table précis
+  const contextReferenceKeywords = [
+    'ce schema', 'ce schéma', 'ce diagramme', 'cette base', 'ces tables', 'ces donnees', 'ces données',
+    'dans le schema', 'dans le schéma', 'du schema', 'du schéma', 'de ce dw', 'ce dw', 'ce data warehouse',
+  ];
+  if (contextReferenceKeywords.some((kw) => lowerMessage.includes(kw))) return true;
+
+  return false;
+}
+private formatRecentHistory(recentExchanges: { user: string; ai: string }[]): string {
+  if (recentExchanges.length === 0) return '';
+  const lines = recentExchanges.map((ex) => `User: ${ex.user}\nAssistant: ${ex.ai}`).join('\n');
+  return `\nRecent conversation (for context, e.g. to understand "also", "why not", follow-ups):\n${lines}\n`;
+}
+
 async applyChatModification(
   database: string,
   currentSchema: any,
   userMessage: string,
+  recentExchanges: { user: string; ai: string }[] = [],
 ): Promise<{ updatedSchema: AiSchemaProposal; explanation: string; schemaChanged: boolean }> {
   const metadata = await this.getMetadataWithCache(database);
   const validTableNames = new Set(metadata.map((cols) => cols[0]?.sourceTable).filter(Boolean));
@@ -1847,108 +2260,143 @@ async applyChatModification(
 
   const internalCurrentSchema = this.restoreInternalNames(currentSchema, validTableNames);
 
-  const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage);
+  // ✅ Question théorique générale (ne mentionne aucune table du schéma, ni référence au contexte)
+  // -> envoyée SANS contexte de schéma, pour éviter que le modèle mélange sa connaissance
+  // générale avec les données spécifiques de ce schéma.
+  if (!this.isQuestionAboutCurrentSchema(userMessage, internalCurrentSchema)) {
+    const historyBlock = this.formatRecentHistory(recentExchanges);
+    const genericPrompt = `Tu es un expert en Business Intelligence et modélisation de data warehouse.
+${historyBlock}
+Question de l'utilisateur : "${userMessage}"
 
-  // Nombre max de tables réelles pouvant disparaître en un seul message avant
-  // de considérer que c'est un oubli du modèle plutôt qu'un retrait volontaire.
-  const MAX_INTENTIONAL_TABLE_DROP = 2;
+Réponds de façon concise et factuelle en français, en te basant uniquement sur ta connaissance générale de la BI (pas de référence à un schéma particulier).
+
+Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
+
+    try {
+      const rawResponse = await this.callOllama(genericPrompt);
+      const cleaned = rawResponse.replace(/```json|```/g, '').trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);
+      return {
+        updatedSchema: currentSchema,
+        explanation: parsed.reply ?? "Je n'ai pas de réponse claire, peux-tu reformuler ?",
+        schemaChanged: false,
+      };
+    } catch (err) {
+      console.warn(`[applyChatModification] Échec question générique: ${err.message}`);
+      return {
+        updatedSchema: currentSchema,
+        explanation: "Je n'ai pas pu traiter cette question, peux-tu reformuler ?",
+        schemaChanged: false,
+      };
+    }
+  }
+
+  // ✅ NOUVEAU : question/remarque liée au schéma actuel MAIS sans verbe d'action clair
+  // (ex: "et dimstoreregion aussi ?", "pourquoi pas ?", "attention X n'est pas lié à Y")
+  // -> traitée comme une clarification informative, avec contexte + historique,
+  // mais SANS jamais déclencher d'action de modification.
+  const ACTION_VERBS = ['retir', 'supprim', 'enlev', 'ajout', 'ajoute', 'deplac', 'déplac', 'transform', 'cree', 'crée', 'change', 'modifi'];
+  const messageHasActionVerb = ACTION_VERBS.some((v) => userMessage.toLowerCase().includes(v));
+
+  if (!messageHasActionVerb) {
+    const historyBlock = this.formatRecentHistory(recentExchanges);
+    const clarificationPrompt = `Tu es un assistant qui aide à comprendre un schéma de data warehouse.
+
+Schéma actuel :
+Dimensions: ${(internalCurrentSchema.dimensions ?? []).join(', ')}
+Facts: ${(internalCurrentSchema.facts ?? []).join(', ')}
+Relations: ${(internalCurrentSchema.confirmedRelations ?? []).map((r: any) => `${r.tableA}.${r.columnA}-${r.tableB}.${r.columnB}`).join('; ')}
+${historyBlock}
+Message de l'utilisateur : "${userMessage}"
+
+Réponds à sa question/remarque en français, en te basant sur le schéma et la conversation ci-dessus. Ne propose aucune modification, réponds juste de façon informative.
+
+Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
+
+    try {
+      const rawResponse = await this.callOllama(clarificationPrompt);
+      const cleaned = rawResponse.replace(/```json|```/g, '').trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);
+      return {
+        updatedSchema: currentSchema,
+        explanation: parsed.reply ?? "Je n'ai pas de réponse claire, peux-tu reformuler ?",
+        schemaChanged: false,
+      };
+    } catch (err) {
+      console.warn(`[applyChatModification] Échec clarification: ${err.message}`);
+      return {
+        updatedSchema: currentSchema,
+        explanation: "Je n'ai pas compris, peux-tu reformuler ?",
+        schemaChanged: false,
+      };
+    }
+  }
+
+  // --- À partir d'ici : un verbe d'action a été détecté, on tente une vraie modification ---
+  const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage, recentExchanges);
 
   let lastError: string | null = null;
   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
     try {
       const rawResponse = await this.callOllama(prompt);
       const cleaned = rawResponse.replace(/```json|```/g, '').trim();
-      const parsed = JSON.parse(cleaned);
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      const action = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);
 
-      const previousDimensions: string[] = internalCurrentSchema.dimensions ?? [];
-      const previousFacts: string[] = internalCurrentSchema.facts ?? [];
-      const previousRealTables = new Set(
-        [...previousDimensions, ...previousFacts]
-          .map((t) => this.stripPrefix(t))
-          .filter((t) => validTableNames.has(t) || validTableNames.has(`staging_${t}`)),
-      );
+      const REMOVAL_KEYWORDS = ['retir', 'supprim', 'enlev', 'remov', 'delete', 'drop'];
+      const isRemovalAction = action.action?.startsWith('remove_');
+      const messageHasRemovalIntent = REMOVAL_KEYWORDS.some((kw) => userMessage.toLowerCase().includes(kw));
 
-      const proposedDimensions: string[] = Array.isArray(parsed.dimensions) ? parsed.dimensions : [];
-      const proposedFacts: string[] = Array.isArray(parsed.facts) ? parsed.facts : [];
-      const proposedRealTables = new Set(
-        [...proposedDimensions, ...proposedFacts]
-          .map((t) => this.stripPrefix(t))
-          .filter((t) => validTableNames.has(t) || validTableNames.has(`staging_${t}`)),
-      );
-
-      const droppedTables = [...previousRealTables].filter((t) => !proposedRealTables.has(t));
-      const dropLooksIntentional =
-        droppedTables.length > 0 && droppedTables.length <= MAX_INTENTIONAL_TABLE_DROP;
-      const dropLooksLikeModelError = droppedTables.length > MAX_INTENTIONAL_TABLE_DROP;
-
-      if (dropLooksLikeModelError) {
-        console.warn(
-          `[applyChatModification] ${droppedTables.length} table(s) auraient disparu (${droppedTables.join(', ')}) — probable oubli du modèle, classification conservée telle quelle.`,
-        );
-      }
-
-      const sourceForValidation = parsed.schemaChanged === false
-        ? internalCurrentSchema
-        : {
-            // ✅ On ne fait confiance à la nouvelle classification que si :
-            //    - le tableau n'est pas vide, ET
-            //    - la perte de tables reste dans une plage plausible pour une action volontaire
-            dimensions:
-              proposedDimensions.length > 0 && !dropLooksLikeModelError
-                ? proposedDimensions
-                : previousDimensions,
-            facts:
-              proposedFacts.length > 0 && !dropLooksLikeModelError
-                ? proposedFacts
-                : previousFacts,
-            confirmedRelations: Array.isArray(parsed.confirmedRelations) && parsed.confirmedRelations.length > 0
-              ? parsed.confirmedRelations
-              : internalCurrentSchema.confirmedRelations,
-            // subDimensions PEUT légitimement devenir [] (ex: "retire toutes les sous-dimensions"),
-            // donc on ne retombe sur l'ancien tableau QUE si le champ est absent (undefined/null).
-            subDimensions: parsed.subDimensions ?? internalCurrentSchema.subDimensions,
-          };
-
-      const validated = this.validateAndClean(
-        {
-          dimensions: sourceForValidation.dimensions,
-          facts: sourceForValidation.facts,
-          confirmedRelations: sourceForValidation.confirmedRelations,
-          additionalRelations: [],
-          subDimensions: sourceForValidation.subDimensions ?? [],
-        } as any,
-        validTableNames,
-        validColumnsByTable,
-        metadata,
-        false, // mode chat : ne force pas la ré-ajout d'une table volontairement retirée
-      );
-
-      const displayed = this.applyDisplayNames(validated);
-
-      if (parsed.schemaChanged === false) {
+      if (isRemovalAction && !messageHasRemovalIntent) {
+        console.warn(`[applyChatModification] Action "${action.action}" rejetée : aucun mot-clé de suppression dans "${userMessage}"`);
         return {
-          updatedSchema: { ...displayed, rawResponse },
-          explanation: parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?",
+          updatedSchema: currentSchema,
+          explanation: "Je n'ai pas compris de demande de suppression claire, peux-tu reformuler ?",
           schemaChanged: false,
         };
       }
 
-      const diffText = this.computeDiffExplanation(internalCurrentSchema, validated);
-      const hasRealChange = diffText !== 'Aucun changement détecté dans le schéma';
+      if (action.action === 'answer_question' || action.action === 'unsupported' || action.action === 'none') {
+        return {
+          updatedSchema: currentSchema,
+          explanation: action.reply ?? "Je n'ai pas de réponse claire, peux-tu reformuler ?",
+          schemaChanged: false,
+        };
+      }
 
-      const modelErrorNote = dropLooksLikeModelError
-        ? `\n\n(Note : ${droppedTables.length} table(s) semblaient disparaître de la classification de façon inattendue — classification d'origine conservée par sécurité, seules les relations/sous-dimensions demandées ont été appliquées.)`
-        : '';
+      const { newSchema, deterministicExplanation, changed } = this.applyChatAction(internalCurrentSchema, action);
 
-      const finalReply =
-        (hasRealChange
-          ? `${parsed.reply ?? ''}\n\n(Changement appliqué : ${diffText})`
-          : parsed.reply ?? "Je n'ai pas de réponse claire à ta demande, peux-tu reformuler ?") + modelErrorNote;
+      if (!changed) {
+        return {
+          updatedSchema: currentSchema,
+          explanation: `${action.reply ?? ''} ${deterministicExplanation}`.trim(),
+          schemaChanged: false,
+        };
+      }
+
+      const validated = this.validateAndClean(
+        {
+          dimensions: newSchema.dimensions,
+          facts: newSchema.facts,
+          confirmedRelations: newSchema.confirmedRelations,
+          additionalRelations: [],
+          subDimensions: newSchema.subDimensions ?? [],
+        } as any,
+        validTableNames,
+        validColumnsByTable,
+        metadata,
+        false,
+      );
+
+      const displayed = this.applyDisplayNames(validated);
 
       return {
         updatedSchema: { ...displayed, rawResponse },
-        explanation: finalReply,
-        schemaChanged: hasRealChange,
+        explanation: `${action.reply ?? ''}\n\n(${deterministicExplanation})`.trim(),
+        schemaChanged: true,
       };
     } catch (err) {
       lastError = err.message;
@@ -1960,5 +2408,4 @@ async applyChatModification(
     `L'IA n'a pas réussi à traiter ta demande après ${this.MAX_RETRIES} tentatives. Dernière erreur: ${lastError}`,
   );
 }
-
 }
