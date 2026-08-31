@@ -315,4 +315,16 @@ private static string BuildVirtualFactTableCreateScript(VirtualFact vf)
     sb.AppendLine(");");
     return sb.ToString();
 }
+private static string BuildVirtualDimensionCreateScript(VirtualDimension vd)
+{
+    var sb = new StringBuilder();
+    sb.AppendLine($"CREATE TABLE [dbo].[{vd.Name}] (");
+
+    var columnDefs = new List<string> { $"    [{vd.Name}Id] INT IDENTITY(1,1) PRIMARY KEY" };
+    columnDefs.AddRange(vd.ExtraColumns.Select(c => $"    [{c.Name}] {c.Type}"));
+
+    sb.AppendLine(string.Join(",\n", columnDefs));
+    sb.AppendLine(");");
+    return sb.ToString();
+}
 }

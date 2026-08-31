@@ -15,6 +15,7 @@ export interface AiSchemaProposal {
   virtualDimensions: VirtualDimension[]; // ← nouveau
   rawResponse: string;
   warnings: string[];
+  excludedColumns: Record<string, string[]>; // { "Employees": ["FirstName"] }
 }
 
 export interface SubDimension {
@@ -208,6 +209,7 @@ private buildTableAttributes(
   subDimensions: SubDimension[],
   virtualFacts: VirtualFact[] = [],
   virtualDimensions: VirtualDimension[] = [],
+  excludedColumns: Record<string, string[]> = {},
 ): Record<string, { name: string; type: string }[]> {
   const attributes: Record<string, { name: string; type: string }[]> = {};
 
@@ -217,12 +219,15 @@ private buildTableAttributes(
     (t) => !virtualFactNames.has(t) && !virtualDimNames.has(t),
   );
 
-  for (const tableName of allRealTables) {
-    const tableMeta = metadata.find((m) => m[0]?.sourceTable === tableName);
-    if (tableMeta) {
-      attributes[tableName] = tableMeta.map((col) => ({ name: col.columnName, type: col.dataType }));
-    }
+for (const tableName of allRealTables) {
+  const tableMeta = metadata.find((m) => m[0]?.sourceTable === tableName);
+  if (tableMeta) {
+    const excluded = new Set((excludedColumns?.[tableName] ?? []).map((c: string) => c.toLowerCase()));
+    attributes[tableName] = tableMeta
+      .filter((col) => !excluded.has(col.columnName.toLowerCase()))
+      .map((col) => ({ name: col.columnName, type: col.dataType }));
   }
+}
 
   for (const gen of generatedDimensions) {
     attributes[gen.name] = gen.columns.map((c: any) => ({ name: c.name, type: c.type }));
@@ -313,6 +318,7 @@ private restoreInternalNames(schema: any, validTableNames: Set<string>): any {
           confirmedRelations: selectedRelations,
           additionalRelations: [],
           subDimensions: subDimensions,
+
         },
         validTableNames,
         validColumnsByTable,
@@ -1829,7 +1835,7 @@ const tableAttributes = this.buildTableAttributes(
   virtualFacts,
   virtualDimensions,
 );
-
+const excludedColumns = (parsed as any).excludedColumns ?? {};
   // --- 11. Retourner le résultat ---
 return {
   dimensions: cleanDimensions,
@@ -1842,6 +1848,7 @@ return {
   tableAttributes,
   virtualFacts,
   virtualDimensions,
+  excludedColumns,
   warnings,
 };
 }
@@ -2090,8 +2097,7 @@ while (schema.facts?.includes(factName) || schema.dimensions?.includes(factName)
     deterministicExplanation: `Table de fait "${factName}" créée avec des clés étrangères vers ${validDimensions.join(', ')}. Elle est vide (aucune source de données) — à peupler manuellement plus tard.`,
     changed: true,
   };
-}
-case 'create_dimension': {
+}case 'create_dimension': {
   const dimName = (action.name && typeof action.name === 'string' && action.name.trim())
     ? action.name.trim()
     : null;
@@ -2117,22 +2123,19 @@ case 'create_dimension': {
 
   const realFactName = (schema.facts ?? []).find((f: string) => this.stripPrefix(f) === linkedFact);
 
-  // ✅ Garde-fou anti-hallucination : on ne garde une colonne proposée par le modèle
-// que si son nom apparaît réellement (même approximativement) dans le message utilisateur,
-// pour éviter qu'il invente des colonnes non demandées.
-const rawExtraColumns = Array.isArray(action.columns)
-  ? action.columns.filter((c: any) => c && typeof c.name === 'string' && typeof c.type === 'string')
-  : [];
+  const rawExtraColumns = Array.isArray(action.columns)
+    ? action.columns.filter((c: any) => c && typeof c.name === 'string' && typeof c.type === 'string')
+    : [];
 
-const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
-const normalizedMessage = normalize(userMessage);
+  const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+  const normalizedMessage = normalize(userMessage);
 
-const extraColumns = rawExtraColumns.filter((c: any) => normalizedMessage.includes(normalize(c.name)));
+  const extraColumns = rawExtraColumns.filter((c: any) => normalizedMessage.includes(normalize(c.name)));
 
-const rejectedColumns = rawExtraColumns.filter((c: any) => !normalizedMessage.includes(normalize(c.name)));
-if (rejectedColumns.length > 0) {
-  console.warn(`[applyChatAction] Colonnes rejetées (non mentionnées dans le message): ${rejectedColumns.map((c: any) => c.name).join(', ')}`);
-}
+  const rejectedColumns = rawExtraColumns.filter((c: any) => !normalizedMessage.includes(normalize(c.name)));
+  if (rejectedColumns.length > 0) {
+    console.warn(`[applyChatAction] Colonnes rejetées (non mentionnées dans le message): ${rejectedColumns.map((c: any) => c.name).join(', ')}`);
+  }
 
   schema.dimensions = [...(schema.dimensions ?? []), dimName];
   schema.virtualDimensions = [
@@ -2151,6 +2154,16 @@ if (rejectedColumns.length > 0) {
     },
   ];
 
+  // ✅ NOUVEAU : synchronise virtualFacts.dimensionNames si le fait cible est un fait virtuel.
+  // Sans ça, DwTableSchemaResolver.GetColumns (côté C#) ne créera jamais la colonne
+  // {dimName}Id sur ce fait, car elle est dérivée de cette liste statique et non des relations.
+  const realFactStripped = this.stripPrefix(realFactName);
+  schema.virtualFacts = (schema.virtualFacts ?? []).map((vf: any) =>
+    this.stripPrefix(vf.name) === realFactStripped
+      ? { ...vf, dimensionNames: [...vf.dimensionNames, dimName] }
+      : vf,
+  );
+
   const columnsNote = extraColumns.length > 0
     ? ` Colonnes ajoutées : ${extraColumns.map((c: any) => `${c.name} (${c.type})`).join(', ')}.`
     : '';
@@ -2161,30 +2174,46 @@ if (rejectedColumns.length > 0) {
     changed: true,
   };
 }
+
 case 'remove_dimension_column': {
   const dimName = action.dimension;
   const colName = action.column;
 
+  // Cas 1 : dimension virtuelle -> retire la colonne de virtualDimensions (comportement existant)
   const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name === dimName);
-  if (!vd) {
-    return { newSchema: schema, deterministicExplanation: `Dimension virtuelle "${dimName}" introuvable, aucun changement.`, changed: false };
+  if (vd) {
+    const before = (vd.extraColumns ?? []).length;
+    vd.extraColumns = (vd.extraColumns ?? []).filter((c: any) => c.name.toLowerCase() !== String(colName).toLowerCase());
+    const changed = vd.extraColumns.length !== before;
+    schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === dimName ? vd : v));
+    return {
+      newSchema: schema,
+      deterministicExplanation: changed ? `Colonne "${colName}" supprimée de la dimension virtuelle "${dimName}".` : `Colonne "${colName}" introuvable dans "${dimName}", aucun changement.`,
+      changed,
+    };
   }
 
-  const before = (vd.extraColumns ?? []).length;
-  vd.extraColumns = (vd.extraColumns ?? []).filter((c: any) => c.name.toLowerCase() !== String(colName).toLowerCase());
-  const changed = vd.extraColumns.length !== before;
+  // Cas 2 : dimension réelle -> exclut la colonne du DW final (données conservées en staging)
+  const realDimExists = (schema.dimensions ?? []).some((d: string) => this.stripPrefix(d) === this.stripPrefix(dimName));
+  if (!realDimExists) {
+    return { newSchema: schema, deterministicExplanation: `Dimension "${dimName}" introuvable, aucun changement.`, changed: false };
+  }
 
-  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === dimName ? vd : v));
+  const strippedDim = this.stripPrefix(dimName);
+  schema.excludedColumns = schema.excludedColumns ?? {};
+  const currentExcluded = schema.excludedColumns[strippedDim] ?? [];
+  if (currentExcluded.some((c: string) => c.toLowerCase() === String(colName).toLowerCase())) {
+    return { newSchema: schema, deterministicExplanation: `Colonne "${colName}" déjà exclue de "${dimName}".`, changed: false };
+  }
+
+  schema.excludedColumns[strippedDim] = [...currentExcluded, colName];
 
   return {
     newSchema: schema,
-    deterministicExplanation: changed
-      ? `Colonne "${colName}" supprimée de la dimension "${dimName}".`
-      : `Colonne "${colName}" introuvable dans "${dimName}", aucun changement.`,
-    changed,
+    deterministicExplanation: `Colonne "${colName}" exclue de la dimension "${dimName}" dans le Data Warehouse (elle reste dans le staging).`,
+    changed: true,
   };
 }
-
 case 'add_dimension_column': {
   const dimName = action.dimension;
   const column = { name: action.columnName, type: action.columnType };
@@ -2648,6 +2677,26 @@ try {
   }
 }
 
+// ✅ Filet de sécurité : le modèle confond souvent "créer une dimension avec une colonne"
+// et "ajouter une colonne à une dimension existante". Si la cible n'existe nulle part
+// et qu'il n'y a qu'un seul fait, on réinterprète l'action comme une création.
+if (action.action === 'add_dimension_column') {
+  const targetName = action.dimension;
+  const existsAsReal = internalCurrentSchema.dimensions?.some((d: string) => this.stripPrefix(d) === this.stripPrefix(targetName));
+  const existsAsVirtual = internalCurrentSchema.virtualDimensions?.some((vd: any) => vd.name === targetName);
+
+  if (!existsAsReal && !existsAsVirtual && (internalCurrentSchema.facts ?? []).length >= 1) {
+    console.warn(`[applyChatModification] "${targetName}" inconnue — reclassé de add_dimension_column vers create_dimension.`);
+    action = {
+      action: 'create_dimension',
+      name: targetName,
+      linkedFact: this.stripPrefix(internalCurrentSchema.facts[0]),
+      columns: [{ name: action.columnName, type: action.columnType }],
+      reply: action.reply,
+    };
+  }
+}
+
       const REMOVAL_KEYWORDS = ['retir', 'supprim', 'enlev', 'remov', 'delete', 'drop'];
       const isRemovalAction = action.action?.startsWith('remove_');
       const messageHasRemovalIntent = REMOVAL_KEYWORDS.some((kw) => userMessage.toLowerCase().includes(kw));
@@ -2689,6 +2738,7 @@ const { newSchema, deterministicExplanation, changed } = this.applyChatAction(in
     subDimensions: newSchema.subDimensions ?? [],
     virtualFacts: newSchema.virtualFacts ?? [],
     virtualDimensions: newSchema.virtualDimensions ?? [],
+    excludedColumns: newSchema.excludedColumns ?? {}
   } as any,
   validTableNames,
   validColumnsByTable,

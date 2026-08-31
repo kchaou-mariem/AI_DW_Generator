@@ -41,14 +41,23 @@ public class EtlRunner : IEtlRunner
             }
 
             // 3. Dimensions simples : copie staging -> DW, avec lookup FK vers leurs sous-dimensions
-            foreach (var dimName in schema.Dimensions)
+         foreach (var dimName in schema.Dimensions)
             {
+                var isVirtual = schema.VirtualDimensions.Any(vd => vd.Name == dimName);
+                if (isVirtual)
+                {
+                    result.Tables.Add(new EtlTableResult
+                    {
+                        TableName = dimName,
+                        RowsInserted = 0,
+                        Warnings = { "Dimension virtuelle (structure uniquement, sans source staging) — à peupler manuellement." }
+                    });
+                    continue;
+                }
+
                 var attributes = schema.TableAttributes.GetValueOrDefault(dimName, new List<TableAttribute>());
-                var subDimsForThisTable = schema.SubDimensions
-                    .Where(sd => sd.ParentDimension == dimName)
-                    .ToList();
-                var tableResult = await LoadSimpleDimensionAsync(
-                    connection, transaction, schema.StagingDatabase, dimName, attributes, subDimsForThisTable);
+                var subDimsForThisTable = schema.SubDimensions.Where(sd => sd.ParentDimension == dimName).ToList();
+                var tableResult = await LoadSimpleDimensionAsync(connection, transaction, schema.StagingDatabase, dimName, attributes, subDimsForThisTable);
                 result.Tables.Add(tableResult);
             }
 

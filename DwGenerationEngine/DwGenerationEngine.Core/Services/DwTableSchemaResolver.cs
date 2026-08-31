@@ -13,13 +13,22 @@ public static class DwTableSchemaResolver
 {
     public static List<ResolvedColumn> GetColumns(string tableName, SchemaProposal schema)
     {
+        var virtualDim = schema.VirtualDimensions.FirstOrDefault(vd => vd.Name == tableName);
+        if (virtualDim != null)
+        {
+            var columns = new List<ResolvedColumn> { new($"{tableName}Id", "INT") };
+            columns.AddRange(virtualDim.ExtraColumns.Select(c => new ResolvedColumn(c.Name, c.Type)));
+            return columns;
+        }
+
         var virtualFact = schema.VirtualFacts.FirstOrDefault(vf => vf.Name == tableName);
         if (virtualFact != null)
         {
             var columns = new List<ResolvedColumn> { new($"{tableName}Id", "INT") };
             columns.AddRange(virtualFact.DimensionNames.Select(dim => new ResolvedColumn($"{dim}Id", "INT")));
             return columns;
-}
+        }
+
         var generatedDim = schema.GeneratedDimensions.FirstOrDefault(gd => gd.Name == tableName);
         if (generatedDim != null)
         {
@@ -70,21 +79,21 @@ public static class DwTableSchemaResolver
 
     /// <summary>Colonnes numériques éligibles à des mesures d'agrégation (exclut les clés techniques).</summary>
     public static List<string> GetNumericMeasureColumns(string factName, SchemaProposal schema)
-{
-    var columns = GetColumns(factName, schema);
-    var pkColumn = $"{factName}Id";
+    {
+        var columns = GetColumns(factName, schema);
+        var pkColumn = $"{factName}Id";
 
-    return columns
-        .Where(c => !c.Name.Equals(pkColumn, StringComparison.OrdinalIgnoreCase))
-        .Where(c => !c.Name.EndsWith("Id", StringComparison.OrdinalIgnoreCase) && !c.Name.EndsWith("Key", StringComparison.OrdinalIgnoreCase))
-        .Where(c => IsNumericSqlType(c.SqlType))
-        .Select(c => c.Name)
-        .ToList();
-}
+        return columns
+            .Where(c => !c.Name.Equals(pkColumn, StringComparison.OrdinalIgnoreCase))
+            .Where(c => !c.Name.EndsWith("Id", StringComparison.OrdinalIgnoreCase) && !c.Name.EndsWith("Key", StringComparison.OrdinalIgnoreCase))
+            .Where(c => IsNumericSqlType(c.SqlType))
+            .Select(c => c.Name)
+            .ToList();
+    }
 
-private static bool IsNumericSqlType(string sqlType)
-{
-    var t = sqlType.ToUpperInvariant();
-    return t.Contains("INT") || t.Contains("DECIMAL") || t.Contains("NUMERIC") || t.Contains("FLOAT") || t.Contains("REAL");
-}
+    private static bool IsNumericSqlType(string sqlType)
+    {
+        var t = sqlType.ToUpperInvariant();
+        return t.Contains("INT") || t.Contains("DECIMAL") || t.Contains("NUMERIC") || t.Contains("FLOAT") || t.Contains("REAL");
+    }
 }

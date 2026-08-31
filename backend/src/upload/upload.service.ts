@@ -644,6 +644,14 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
   const dimensions = (rawSchema.dimensions ?? []).map(stripPrefix).filter((d: string) => d !== 'DimTemps');
   const facts = (rawSchema.facts ?? []).map(stripPrefix);
 
+  // Faits et dimensions virtuels : à transmettre à .NET et à exclure de la lecture staging
+  const virtualFacts = (rawSchema.virtualFacts ?? []).map((vf: any) => ({
+    name: stripPrefix(vf.name),
+    dimensionNames: (vf.dimensionNames ?? []).map(stripPrefix),
+  }));
+  const virtualFactNames = new Set(virtualFacts.map((vf: any) => vf.name));
+  const virtualDimNames = new Set((rawSchema.virtualDimensions ?? []).map((vd: any) => stripPrefix(vd.name)));
+
   const confirmedRelations = (rawSchema.confirmedRelations ?? []).map((r: any) => ({
     tableA: stripPrefix(r.tableA),
     columnA: r.columnA,
@@ -667,15 +675,32 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
     sourceColumn: sd.sourceColumn,
     generatedPrimaryKey: sd.generatedPrimaryKey,
   }));
+const virtualDimensions = (rawSchema.virtualDimensions ?? []).map((vd: any) => {
+  const dimName = stripPrefix(vd.name);
+  // extraColumns ne doit JAMAIS contenir la clé technique {dimName}Id, ajoutée
+  // automatiquement côté DdlGenerator — on l'exclut explicitement par sécurité.
+  const cleanedExtraColumns = (vd.extraColumns ?? []).filter(
+    (c: any) => c.name.toLowerCase() !== `${dimName.toLowerCase()}id`,
+  );
+  return {
+    name: dimName,
+    linkedFact: stripPrefix(vd.linkedFact),
+    extraColumns: cleanedExtraColumns,
+  };
+});
 
   const generatedDimensions = rawSchema.generatedDimensions ?? [];
 
-  // tableAttributes : colonnes réelles lues depuis le staging pour chaque dimension/fait
   const tableAttributes: Record<string, { name: string; type: string }[]> = {};
 
   const pool = await this.getPool(database);
   try {
-    for (const tableName of [...dimensions, ...facts]) {
+    // Exclure les faits/dimensions virtuels : pas de table staging correspondante à lire
+    const realTables = [...dimensions, ...facts].filter(
+      (t) => !virtualFactNames.has(t) && !virtualDimNames.has(t),
+    );
+
+    for (const tableName of realTables) {
       const stagingTable = `staging_${tableName}`;
       const columnsResult = await pool.request().query(`
         SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE
@@ -690,7 +715,6 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
       }));
     }
 
-    // Colonnes des sous-dimensions et dimensions générées (structure fixe, pas de lecture staging)
     for (const sd of subDimensions) {
       tableAttributes[sd.name] = [
         { name: sd.generatedPrimaryKey, type: 'INT' },
@@ -700,6 +724,32 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
     for (const gd of generatedDimensions) {
       tableAttributes[gd.name] = gd.columns.map((c: any) => ({ name: c.name, type: c.type }));
     }
+
+    // Faits/dimensions virtuels : les colonnes ont déjà été calculées côté AiService
+    // (buildTableAttributes), on les récupère telles quelles depuis rawSchema plutôt
+    // que de les régénérer ici (pas de source staging à interroger pour eux).
+    for (const vf of virtualFacts) {
+      const original = rawSchema.tableAttributes?.[vf.name] ?? rawSchema.tableAttributes?.[`staging_${vf.name}`];
+      tableAttributes[vf.name] = original && original.length > 0
+        ? original
+        : [
+            { name: `${vf.name}Id`, type: 'INT' },
+            ...vf.dimensionNames.map((d: string) => ({ name: `${d}Id`, type: 'INT' })),
+          ];
+    }
+
+   for (const vd of (rawSchema.virtualDimensions ?? [])) {
+  const vdName = stripPrefix(vd.name);
+  const original = rawSchema.tableAttributes?.[vd.name] ?? rawSchema.tableAttributes?.[`staging_${vd.name}`];
+  const pkColumnName = `${vdName}Id`.toLowerCase();
+
+  if (original && original.length > 0) {
+    // Ne garde que les colonnes autres que la PK technique, celle-ci sera régénérée par .NET
+    tableAttributes[vdName] = original.filter((c: any) => c.name.toLowerCase() !== pkColumnName);
+  } else {
+    tableAttributes[vdName] = (vd.extraColumns ?? []).filter((c: any) => c.name.toLowerCase() !== pkColumnName);
+  }
+}
   } finally {
     await pool.close();
   }
@@ -714,6 +764,8 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
     factColumnTransformations,
     subDimensions,
     tableAttributes,
+    virtualFacts, // <-- champ manquant, maintenant transmis
+    virtualDimensions,
   };
 }
 

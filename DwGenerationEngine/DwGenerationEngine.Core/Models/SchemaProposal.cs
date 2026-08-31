@@ -12,6 +12,8 @@ public class SchemaProposal
     public List<GeneratedDimension> GeneratedDimensions { get; set; } = new();
     public List<FactColumnTransformation> FactColumnTransformations { get; set; } = new();
     public List<VirtualFact> VirtualFacts { get; set; } = new();
+        public List<VirtualDimension> VirtualDimensions { get; set; } = new();
+
 }
 
 public class ConfirmedRelation
@@ -63,4 +65,11 @@ public class VirtualFact
 {
     public required string Name { get; set; }
     public List<string> DimensionNames { get; set; } = new();
+}
+
+public class VirtualDimension
+{
+    public required string Name { get; set; }
+    public required string LinkedFact { get; set; }
+    public List<TableAttribute> ExtraColumns { get; set; } = new();
 }
