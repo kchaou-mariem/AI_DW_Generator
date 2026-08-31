@@ -56,19 +56,27 @@ public class EtlRunner : IEtlRunner
             var allFactLinks = FactRelationResolver.Resolve(schema);
 
             foreach (var factName in schema.Facts)
-            {
-                var attributes = schema.TableAttributes.GetValueOrDefault(factName, new List<TableAttribute>());
-                var transformations = schema.FactColumnTransformations
-                    .Where(t => t.FactTable == factName)
-                    .ToList();
-                var factLinks = allFactLinks
-                    .Where(l => l.FactTable == factName)
-                    .ToList();
+{
+    var isVirtual = schema.VirtualFacts.Any(vf => vf.Name == factName);
+    if (isVirtual)
+    {
+        result.Tables.Add(new EtlTableResult
+        {
+            TableName = factName,
+            RowsInserted = 0,
+            Warnings = { "Fait virtuel (structure uniquement, sans source staging) — à peupler manuellement." }
+        });
+        continue;
+    }
 
-                var tableResult = await LoadFactTableAsync(
-                    connection, transaction, schema.StagingDatabase, factName, attributes, transformations, factLinks);
-                result.Tables.Add(tableResult);
-            }
+    var attributes = schema.TableAttributes.GetValueOrDefault(factName, new List<TableAttribute>());
+    var transformations = schema.FactColumnTransformations.Where(t => t.FactTable == factName).ToList();
+    var factLinks = allFactLinks.Where(l => l.FactTable == factName).ToList();
+
+    var tableResult = await LoadFactTableAsync(
+        connection, transaction, schema.StagingDatabase, factName, attributes, transformations, factLinks);
+    result.Tables.Add(tableResult);
+}
 
             transaction.Commit();
             return result;
@@ -94,7 +102,7 @@ public class EtlRunner : IEtlRunner
     {
         // DELETE au lieu de TRUNCATE : TRUNCATE refuse de vider une table dès qu'une FK
         // existe vers elle, même si la table qui référence est vide ou pas encore vidée.
-        var deleteOrder = schema.Facts
+        var deleteOrder = schema.Facts.Where(f => !schema.VirtualFacts.Any(vf => vf.Name == f))
             .Concat(schema.Dimensions)
             .Concat(schema.SubDimensions.Select(sd => sd.Name))
             .Concat(schema.GeneratedDimensions.Select(gd => gd.Name));
@@ -104,6 +112,8 @@ public class EtlRunner : IEtlRunner
             var sql = $"DELETE FROM [dbo].[{tableName}];";
             await ExecuteNonQueryAsync(connection, transaction, sql);
         }
+
+
     }
 
     // ---------- DimTemps (dimension temporelle générée) ----------

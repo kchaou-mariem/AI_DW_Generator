@@ -11,6 +11,7 @@ public class SchemaProposal
     public Dictionary<string, List<TableAttribute>> TableAttributes { get; set; } = new();
     public List<GeneratedDimension> GeneratedDimensions { get; set; } = new();
     public List<FactColumnTransformation> FactColumnTransformations { get; set; } = new();
+    public List<VirtualFact> VirtualFacts { get; set; } = new();
 }
 
 public class ConfirmedRelation
@@ -57,4 +58,9 @@ public class FactColumnTransformation
     public required string NewColumnType { get; set; }
     public required string ReferencesTable { get; set; }
     public required string ReferencesColumn { get; set; }
+}
+public class VirtualFact
+{
+    public required string Name { get; set; }
+    public List<string> DimensionNames { get; set; } = new();
 }

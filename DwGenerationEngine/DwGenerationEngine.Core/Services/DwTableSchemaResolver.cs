@@ -13,6 +13,13 @@ public static class DwTableSchemaResolver
 {
     public static List<ResolvedColumn> GetColumns(string tableName, SchemaProposal schema)
     {
+        var virtualFact = schema.VirtualFacts.FirstOrDefault(vf => vf.Name == tableName);
+        if (virtualFact != null)
+        {
+            var columns = new List<ResolvedColumn> { new($"{tableName}Id", "INT") };
+            columns.AddRange(virtualFact.DimensionNames.Select(dim => new ResolvedColumn($"{dim}Id", "INT")));
+            return columns;
+}
         var generatedDim = schema.GeneratedDimensions.FirstOrDefault(gd => gd.Name == tableName);
         if (generatedDim != null)
         {

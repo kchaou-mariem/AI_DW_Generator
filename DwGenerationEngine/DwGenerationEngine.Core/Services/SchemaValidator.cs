@@ -55,10 +55,11 @@ public static class SchemaValidator
                 result.Errors.Add($"Aucun tableAttributes trouvé (ou vide) pour la dimension '{dimName}'.");
         }
         foreach (var factName in schema.Facts)
-        {
+{
+            if (schema.VirtualFacts.Any(vf => vf.Name == factName)) continue; // fait virtuel : pas de tableAttributes attendu
             if (!schema.TableAttributes.TryGetValue(factName, out var attrs) || attrs.Count == 0)
                 result.Errors.Add($"Aucun tableAttributes trouvé (ou vide) pour le fait '{factName}'.");
-        }
+}
 
         // --- SubDimensions : parentDimension doit exister dans Dimensions ---
         foreach (var sd in schema.SubDimensions)

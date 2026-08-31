@@ -10,16 +10,30 @@ export interface AiSchemaProposal {
   generatedDimensions: any[];
   factColumnTransformations: any[];
   subDimensions: SubDimension[];
-  tableAttributes: Record<string, { name: string; type: string }[]>; // ← nouveau
+  tableAttributes: Record<string, { name: string; type: string }[]>;
+  virtualFacts: VirtualFact[];
+  virtualDimensions: VirtualDimension[]; // ← nouveau
   rawResponse: string;
   warnings: string[];
 }
+
 export interface SubDimension {
   name: string;
   parentDimension: string;
   sourceColumn: string;
   generatedPrimaryKey: string;
 }
+export interface VirtualFact {
+  name: string;
+  dimensionNames: string[];
+}
+
+export interface VirtualDimension {
+  name: string;
+  linkedFact: string;
+  extraColumns?: { name: string; type: string }[];
+}
+
 
 @Injectable()
 export class AiService {
@@ -192,10 +206,17 @@ private buildTableAttributes(
   metadata: ColumnMetadata[][],
   generatedDimensions: any[],
   subDimensions: SubDimension[],
+  virtualFacts: VirtualFact[] = [],
+  virtualDimensions: VirtualDimension[] = [],
 ): Record<string, { name: string; type: string }[]> {
   const attributes: Record<string, { name: string; type: string }[]> = {};
 
-  const allRealTables = [...cleanDimensions, ...cleanFacts];
+  const virtualFactNames = new Set(virtualFacts.map((vf) => vf.name));
+  const virtualDimNames = new Set(virtualDimensions.map((vd) => vd.name));
+  const allRealTables = [...cleanDimensions, ...cleanFacts].filter(
+    (t) => !virtualFactNames.has(t) && !virtualDimNames.has(t),
+  );
+
   for (const tableName of allRealTables) {
     const tableMeta = metadata.find((m) => m[0]?.sourceTable === tableName);
     if (tableMeta) {
@@ -211,6 +232,20 @@ private buildTableAttributes(
     attributes[sd.name] = [
       { name: sd.generatedPrimaryKey, type: 'INT' },
       { name: sd.sourceColumn, type: 'VARCHAR' },
+    ];
+  }
+
+  for (const vf of virtualFacts) {
+    attributes[vf.name] = [
+      { name: `${vf.name}Id`, type: 'INT' },
+      ...vf.dimensionNames.map((d: string) => ({ name: `${d}Id`, type: 'INT' })),
+    ];
+  }
+
+  for (const vd of virtualDimensions) {
+    attributes[vd.name] = [
+      { name: `${vd.name}Id`, type: 'INT' },
+      ...(vd.extraColumns ?? []),
     ];
   }
 
@@ -955,6 +990,7 @@ private async detectSubDimensions(metadata: ColumnMetadata[][]): Promise<any[]> 
 
 //     const isKnownOrDerived = (t: string, bucket: string): boolean => {
 //       if (validTableNames.has(t)) return true;
+
 //       if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
 //         warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
 //         return true;
@@ -1448,15 +1484,26 @@ private validateAndClean(
   }
 
   // --- 1. Normalisation des dimensions et faits ---
-  const isKnownOrDerived = (t: string, bucket: string): boolean => {
-    if (validTableNames.has(t)) return true;
-    if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
-      warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
-      return true;
-    }
-    warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
-    return false;
-  };
+const incomingVirtualFactNames = new Set(((parsed as any).virtualFacts ?? []).map((vf: any) => vf.name));
+const incomingVirtualDimNames = new Set(((parsed as any).virtualDimensions ?? []).map((vd: any) => vd.name));
+
+const isKnownOrDerived = (t: string, bucket: string): boolean => {
+  if (validTableNames.has(t)) return true;
+  if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
+    warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
+    return true;
+  }
+  if (bucket === 'facts' && incomingVirtualFactNames.has(t)) {
+    warnings.push(`Fait virtuel accepté (structure sans données source): ${t}`);
+    return true;
+  }
+  if (bucket === 'dimensions' && incomingVirtualDimNames.has(t)) {
+    warnings.push(`Dimension virtuelle acceptée (structure sans données source): ${t}`);
+    return true;
+  }
+  warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
+  return false;
+};
 
   const normalizedDimensions = parsed.dimensions
     .map((t) => this.normalizeTableEntry(t, validTableNames))
@@ -1501,50 +1548,83 @@ private validateAndClean(
       cleanFacts.push(candidate);
     }
   }
+// ✅ NOUVEAU : si AUCUN fait n'a pu être identifié (ni par l'IA, ni par l'heuristique),
+// on construit automatiquement une table de fait virtuelle qui relie toutes les dimensions
+// entre elles. Elle reste vide (aucune source staging), à peupler manuellement plus tard.
+// Note : cleanDimensions est encore préfixé (staging_) à ce stade de la méthode, donc
+// virtualFacts.dimensionNames doit être nettoyé explicitement via stripPrefix.
+let autoVirtualFacts: VirtualFact[] = [];
+let autoVirtualFactRelations: any[] = [];
+
+if (cleanFacts.length === 0 && cleanDimensions.length >= 2) {
+  const factName = 'Fact';
+  const strippedDimensionNames = cleanDimensions.map((d) => this.stripPrefix(d));
+
+  warnings.push(
+    `Aucune table de fait détectée parmi les tables uploadées — "${factName}" créée automatiquement, reliant toutes les dimensions (${strippedDimensionNames.join(', ')}). Cette table est vide et devra être peuplée manuellement.`,
+  );
+
+  cleanFacts.push(factName);
+  autoVirtualFacts.push({ name: factName, dimensionNames: strippedDimensionNames });
+
+  autoVirtualFactRelations = strippedDimensionNames.map((dim) => ({
+    tableA: factName,
+    columnA: `${dim}Id`,
+    tableB: dim,
+    columnB: `${dim}Id`,
+    reason: 'fait_virtuel_genere_automatiquement',
+  }));
+}
 
   // --- 2. Validation structurelle des relations ---
   // ✅ NOUVEAU : garde-fou de type, avant tout appel à .replace() via stripPrefix,
   // pour éviter "t.replace is not a function" quand le modèle IA renvoie
   // un tableA/tableB/columnA/columnB qui n'est pas une chaîne (objet, null, nombre...).
   const structurallyValid = (r: any): boolean => {
-    if (!r || typeof r !== 'object') {
-      warnings.push(`Relation ignorée (format invalide): ${JSON.stringify(r)}`);
-      return false;
-    }
-    if (
-      typeof r.tableA !== 'string' ||
-      typeof r.columnA !== 'string' ||
-      typeof r.tableB !== 'string' ||
-      typeof r.columnB !== 'string' ||
-      !r.tableA || !r.columnA || !r.tableB || !r.columnB
-    ) {
-      warnings.push(`Relation incomplète ou mal typée ignorée: ${JSON.stringify(r)}`);
-      return false;
-    }
+  if (!r || typeof r !== 'object') {
+    warnings.push(`Relation ignorée (format invalide): ${JSON.stringify(r)}`);
+    return false;
+  }
+  if (
+    typeof r.tableA !== 'string' || typeof r.columnA !== 'string' ||
+    typeof r.tableB !== 'string' || typeof r.columnB !== 'string' ||
+    !r.tableA || !r.columnA || !r.tableB || !r.columnB
+  ) {
+    warnings.push(`Relation incomplète ou mal typée ignorée: ${JSON.stringify(r)}`);
+    return false;
+  }
 
-    r.tableA = this.stripPrefix(r.tableA);
-    r.tableB = this.stripPrefix(r.tableB);
+  r.tableA = this.stripPrefix(r.tableA);
+  r.tableB = this.stripPrefix(r.tableB);
 
-    if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
-      warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
-      return false;
-    }
+  if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
+    warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
+    return false;
+  }
 
-    const colsA = normalizedValidColumns.get(r.tableA);
-    if (!colsA || !colsA.has(r.columnA)) {
-      warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
-      return false;
-    }
-    const colsB = normalizedValidColumns.get(r.tableB);
-    if (!colsB || !colsB.has(r.columnB)) {
-      warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
-      return false;
-    }
-    return true;
-  };
+  // ✅ NOUVEAU : une relation générée pour un fait virtuel référence des colonnes techniques
+  // (ex: CurrenciesId) qui n'existent pas dans le staging — c'est normal, on l'accepte telle quelle.
+if (
+  r.reason === 'fait_virtuel_genere_via_chat' ||
+  r.reason === 'fait_virtuel_genere_automatiquement' ||
+  r.reason === 'dimension_virtuelle_generee_via_chat'
+) return true;
+
+  const colsA = normalizedValidColumns.get(r.tableA);
+  if (!colsA || !colsA.has(r.columnA)) {
+    warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
+    return false;
+  }
+  const colsB = normalizedValidColumns.get(r.tableB);
+  if (!colsB || !colsB.has(r.columnB)) {
+    warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
+    return false;
+  }
+  return true;
+};
 
   // --- 3. Validation de la constellation ---
-  const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations].filter(structurallyValid);
+const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations, ...autoVirtualFactRelations].filter(structurallyValid);
 
   const cleanFactsStripped = new Set(cleanFacts.map((t) => this.stripPrefix(t)));
   const cleanDimensionsStripped = new Set(cleanDimensions.map((t) => this.stripPrefix(t)));
@@ -1576,10 +1656,10 @@ private validateAndClean(
   };
 
   // --- 4. Construire les relations confirmées ---
-  let confirmedRelations = parsed.confirmedRelations
-    .filter(structurallyValid)
-    .filter(isValidRelation)
-    .map((r: any) => ({ ...r, reason: r.reason || 'relation_confirmee_par_ia' }));
+let confirmedRelations = [...parsed.confirmedRelations, ...autoVirtualFactRelations]
+  .filter(structurallyValid)
+  .filter(isValidRelation)
+  .map((r: any) => ({ ...r, reason: r.reason || 'relation_confirmee_par_ia' }));
 
   let additionalRelations = parsed.additionalRelations
     .filter(structurallyValid)
@@ -1737,26 +1817,33 @@ private validateAndClean(
   }
 
   // --- 10. Construction des attributs des tables ---
-  const tableAttributes = this.buildTableAttributes(
-    cleanDimensions,
-    cleanFacts,
-    metadata,
-    generatedDimensions,
-    subDimensions,
-  );
+const virtualFacts: VirtualFact[] = [...((parsed as any).virtualFacts ?? []), ...autoVirtualFacts];
+const virtualDimensions: VirtualDimension[] = (parsed as any).virtualDimensions ?? [];
+
+const tableAttributes = this.buildTableAttributes(
+  cleanDimensions,
+  cleanFacts,
+  metadata,
+  generatedDimensions,
+  subDimensions,
+  virtualFacts,
+  virtualDimensions,
+);
 
   // --- 11. Retourner le résultat ---
-  return {
-    dimensions: cleanDimensions,
-    facts: cleanFacts,
-    confirmedRelations: finalConfirmedRelationsClean,
-    additionalRelations: additionalRelationsClean,
-    generatedDimensions,
-    factColumnTransformations,
-    subDimensions,
-    tableAttributes,
-    warnings,
-  };
+return {
+  dimensions: cleanDimensions,
+  facts: cleanFacts,
+  confirmedRelations: finalConfirmedRelationsClean,
+  additionalRelations: additionalRelationsClean,
+  generatedDimensions,
+  factColumnTransformations,
+  subDimensions,
+  tableAttributes,
+  virtualFacts,
+  virtualDimensions,
+  warnings,
+};
 }
 // private buildChatPrompt(currentSchema: any, userMessage: string): string {
 //   return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
@@ -1944,6 +2031,121 @@ case 'remove_fact': {
       };
     }
 
+
+case 'create_fact_table': {
+  let dimensions: string[] = Array.isArray(action.dimensions) ? action.dimensions : [];
+  dimensions = dimensions.map((d: string) => this.stripPrefix(d));
+
+  // ✅ NOUVEAU : schema.dimensions peut être préfixé (staging_) à ce stade,
+  // on compare donc sur des versions sans préfixe des deux côtés.
+  const schemaDimensionsStripped = (schema.dimensions ?? []).map((d: string) => this.stripPrefix(d));
+
+  let validDimensions = dimensions.filter((d: string) => schemaDimensionsStripped.includes(d));
+
+  if (validDimensions.length < 2) {
+    validDimensions = [...schemaDimensionsStripped]; // ✅ fallback aussi nettoyé du préfixe
+  }
+
+  if (validDimensions.length < 2) {
+    return {
+      newSchema: schema,
+      deterministicExplanation: `Impossible de créer le fait : au moins 2 dimensions sont nécessaires dans le schéma (trouvé: ${validDimensions.length}).`,
+      changed: false,
+    };
+  }
+
+  // const factName = (action.name && typeof action.name === 'string' && action.name.trim())
+  //   ? action.name.trim()
+  //   : 'Fact';
+  // Le nom par défaut est toujours "Fact" (ou "Fact2", "Fact3"... si déjà utilisé),
+// sauf si l'utilisateur a explicitement précisé un nom dans son message d'origine
+// (détecté via un mot-clé "nommé"/"appelé"/"named" dans le message, pas dans le JSON du modèle).
+let factName = 'Fact';
+let suffix = 2;
+while (schema.facts?.includes(factName) || schema.dimensions?.includes(factName)) {
+  factName = `Fact${suffix}`;
+  suffix++;
+}
+
+  if (schema.facts?.includes(factName) || schema.dimensions?.includes(factName)) {
+    return { newSchema: schema, deterministicExplanation: `Le nom "${factName}" est déjà utilisé, aucun changement.`, changed: false };
+  }
+
+  schema.facts = [...(schema.facts ?? []), factName];
+  schema.virtualFacts = [...(schema.virtualFacts ?? []), { name: factName, dimensionNames: validDimensions }];
+
+  const newRelations = validDimensions.map((dim: string) => ({
+    tableA: factName,
+    columnA: `${dim}Id`,
+    tableB: dim,
+    columnB: `${dim}Id`,
+    reason: 'fait_virtuel_genere_via_chat',
+  }));
+  schema.confirmedRelations = [...(schema.confirmedRelations ?? []), ...newRelations];
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Table de fait "${factName}" créée avec des clés étrangères vers ${validDimensions.join(', ')}. Elle est vide (aucune source de données) — à peupler manuellement plus tard.`,
+    changed: true,
+  };
+}
+case 'create_dimension': {
+  const dimName = (action.name && typeof action.name === 'string' && action.name.trim())
+    ? action.name.trim()
+    : null;
+
+  if (!dimName) {
+    return { newSchema: schema, deterministicExplanation: `Nom de dimension manquant, aucun changement.`, changed: false };
+  }
+
+  if (schema.dimensions?.includes(dimName) || schema.facts?.includes(dimName)) {
+    return { newSchema: schema, deterministicExplanation: `Le nom "${dimName}" est déjà utilisé, aucun changement.`, changed: false };
+  }
+
+  const linkedFact = this.stripPrefix(action.linkedFact ?? '');
+  const schemaFactsStripped = (schema.facts ?? []).map((f: string) => this.stripPrefix(f));
+
+  if (!linkedFact || !schemaFactsStripped.includes(linkedFact)) {
+    return {
+      newSchema: schema,
+      deterministicExplanation: `Impossible de créer "${dimName}" : aucun fait valide précisé pour la relier (une dimension virtuelle doit obligatoirement être reliée à un fait existant).`,
+      changed: false,
+    };
+  }
+
+  const realFactName = (schema.facts ?? []).find((f: string) => this.stripPrefix(f) === linkedFact);
+
+  const extraColumns = Array.isArray(action.columns)
+    ? action.columns.filter((c: any) => c && typeof c.name === 'string' && typeof c.type === 'string')
+    : [];
+
+  schema.dimensions = [...(schema.dimensions ?? []), dimName];
+  schema.virtualDimensions = [
+    ...(schema.virtualDimensions ?? []),
+    { name: dimName, linkedFact: linkedFact, extraColumns },
+  ];
+
+  schema.confirmedRelations = [
+    ...(schema.confirmedRelations ?? []),
+    {
+      tableA: realFactName,
+      columnA: `${dimName}Id`,
+      tableB: dimName,
+      columnB: `${dimName}Id`,
+      reason: 'dimension_virtuelle_generee_via_chat',
+    },
+  ];
+
+  const columnsNote = extraColumns.length > 0
+    ? ` Colonnes ajoutées : ${extraColumns.map((c: any) => `${c.name} (${c.type})`).join(', ')}.`
+    : '';
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Dimension "${dimName}" créée (vide, à peupler manuellement) et reliée à "${linkedFact}".${columnsNote}`,
+    changed: true,
+  };
+}
     default:
       return { newSchema: schema, deterministicExplanation: '', changed: false };
   }
@@ -2028,6 +2230,8 @@ Available actions for ACTUAL modifications:
 - {"action":"add_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
 - {"action":"remove_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
 - {"action":"remove_subdimension","name":"DimX","reply":"..."}
+- {"action":"create_fact_table","name":"FactName","dimensions":["Dim1","Dim2"],"reply":"..."} — create a NEW empty fact table with foreign keys to the listed dimensions (dimensions must be EXACT names from the list above, at least 2)
+- {"action":"create_dimension","name":"DimName","linkedFact":"FactName","columns":[{"name":"colName","type":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)"}],"reply":"..."} — create a NEW empty dimension table linked to an EXISTING fact table. "columns" is OPTIONAL: only include extra columns explicitly requested by the user (besides the automatic primary key). Map data types mentioned in French to SQL types (e.g. "salaire"/"montant" -> DECIMAL(18,4), "nombre"/"entier" -> INT, "texte"/"nom" -> VARCHAR(255), "date" -> DATE).
 
 Rules:
 - "table"/"name" must be an EXACT name from the lists above. If it does not match exactly, use "answer_question" instead and explain the name was not found.
@@ -2238,6 +2442,8 @@ private isQuestionAboutCurrentSchema(userMessage: string, schema: any): boolean 
 
   return false;
 }
+
+
 private formatRecentHistory(recentExchanges: { user: string; ai: string }[]): string {
   if (recentExchanges.length === 0) return '';
   const lines = recentExchanges.map((ex) => `User: ${ex.user}\nAssistant: ${ex.ai}`).join('\n');
@@ -2377,19 +2583,22 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
         };
       }
 
-      const validated = this.validateAndClean(
-        {
-          dimensions: newSchema.dimensions,
-          facts: newSchema.facts,
-          confirmedRelations: newSchema.confirmedRelations,
-          additionalRelations: [],
-          subDimensions: newSchema.subDimensions ?? [],
-        } as any,
-        validTableNames,
-        validColumnsByTable,
-        metadata,
-        false,
-      );
+      
+ const validated = this.validateAndClean(
+  {
+    dimensions: newSchema.dimensions,
+    facts: newSchema.facts,
+    confirmedRelations: newSchema.confirmedRelations,
+    additionalRelations: [],
+    subDimensions: newSchema.subDimensions ?? [],
+    virtualFacts: newSchema.virtualFacts ?? [],
+    virtualDimensions: newSchema.virtualDimensions ?? [],
+  } as any,
+  validTableNames,
+  validColumnsByTable,
+  metadata,
+  false,
+);
 
       const displayed = this.applyDisplayNames(validated);
 

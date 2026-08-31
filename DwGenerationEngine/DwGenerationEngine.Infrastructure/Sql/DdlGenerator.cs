@@ -109,21 +109,27 @@ public class DdlGenerator : IDdlGenerator
             var allFactLinks = FactRelationResolver.Resolve(schema);
 
             foreach (var factName in schema.Facts)
-            {
-                var attributes = schema.TableAttributes.GetValueOrDefault(factName, new List<TableAttribute>());
-                var transformations = schema.FactColumnTransformations
-                    .Where(t => t.FactTable == factName)
-                    .ToList();
-                var factLinks = allFactLinks
-                    .Where(l => l.FactTable == factName)
-                    .ToList();
+{
+    var virtualFact = schema.VirtualFacts.FirstOrDefault(vf => vf.Name == factName);
 
-                var sql = BuildFactTableCreateScript(factName, attributes, transformations, factLinks);
-                await ExecuteNonQueryAsync(connection, sql);
-                result.ExecutedScripts.Add(sql);
-                result.CreatedTables.Add(factName);
-            }
+    string sql;
+    if (virtualFact != null)
+    {
+        // Fait "inventé" : structure seule (PK + FK vers dimensions), jamais peuplé automatiquement.
+        sql = BuildVirtualFactTableCreateScript(virtualFact);
+    }
+    else
+    {
+        var attributes = schema.TableAttributes.GetValueOrDefault(factName, new List<TableAttribute>());
+        var transformations = schema.FactColumnTransformations.Where(t => t.FactTable == factName).ToList();
+        var factLinks = allFactLinks.Where(l => l.FactTable == factName).ToList();
+        sql = BuildFactTableCreateScript(factName, attributes, transformations, factLinks);
+    }
 
+    await ExecuteNonQueryAsync(connection, sql);
+    result.ExecutedScripts.Add(sql);
+    result.CreatedTables.Add(factName);
+}
             return result;
         }
         catch (Exception ex)
@@ -288,5 +294,25 @@ public class DdlGenerator : IDdlGenerator
     }
 
     return orphanTables;
+}
+
+private static string BuildVirtualFactTableCreateScript(VirtualFact vf)
+{
+    var sb = new StringBuilder();
+    sb.AppendLine($"CREATE TABLE [dbo].[{vf.Name}] (");
+
+    var columnDefs = new List<string>
+    {
+        $"    [{vf.Name}Id] INT IDENTITY(1,1) PRIMARY KEY"
+    };
+
+    columnDefs.AddRange(
+        vf.DimensionNames.Select(dim =>
+            $"    [{dim}Id] INT NULL FOREIGN KEY REFERENCES [dbo].[{dim}]([{dim}Id])")
+    );
+
+    sb.AppendLine(string.Join(",\n", columnDefs));
+    sb.AppendLine(");");
+    return sb.ToString();
 }
 }

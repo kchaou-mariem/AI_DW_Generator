@@ -70,3 +70,8 @@ export interface UploadResponse {
   database: string;
   files: UploadResult[];
 }
+
+export interface VirtualFact {
+  name: string;
+  dimensionNames: string[];
+}
