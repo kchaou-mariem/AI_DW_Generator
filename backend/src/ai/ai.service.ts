@@ -2180,15 +2180,15 @@ case 'remove_dimension_column': {
   const colName = action.column;
 
   // Cas 1 : dimension virtuelle -> retire la colonne de virtualDimensions (comportement existant)
-  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name === dimName);
+  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name.toLowerCase() === String(dimName).toLowerCase());
   if (vd) {
     const before = (vd.extraColumns ?? []).length;
     vd.extraColumns = (vd.extraColumns ?? []).filter((c: any) => c.name.toLowerCase() !== String(colName).toLowerCase());
     const changed = vd.extraColumns.length !== before;
-    schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === dimName ? vd : v));
+    schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === vd.name ? vd : v));
     return {
       newSchema: schema,
-      deterministicExplanation: changed ? `Colonne "${colName}" supprimée de la dimension virtuelle "${dimName}".` : `Colonne "${colName}" introuvable dans "${dimName}", aucun changement.`,
+      deterministicExplanation: changed ? `Colonne "${colName}" supprimée de la dimension virtuelle "${vd.name}".` : `Colonne "${colName}" introuvable dans "${vd.name}", aucun changement.`,
       changed,
     };
   }
@@ -2214,6 +2214,7 @@ case 'remove_dimension_column': {
     changed: true,
   };
 }
+
 case 'add_dimension_column': {
   const dimName = action.dimension;
   const column = { name: action.columnName, type: action.columnType };
@@ -2231,22 +2232,189 @@ case 'add_dimension_column': {
     return { newSchema: schema, deterministicExplanation: `Impossible de confirmer la colonne "${column.name}" à partir du message, aucun changement.`, changed: false };
   }
 
-  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name === dimName);
+  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name.toLowerCase() === String(dimName).toLowerCase());
   if (!vd) {
     return { newSchema: schema, deterministicExplanation: `Dimension virtuelle "${dimName}" introuvable, aucun changement.`, changed: false };
   }
 
   const alreadyExists = (vd.extraColumns ?? []).some((c: any) => c.name.toLowerCase() === column.name.toLowerCase());
   if (alreadyExists) {
-    return { newSchema: schema, deterministicExplanation: `La colonne "${column.name}" existe déjà dans "${dimName}", aucun changement.`, changed: false };
+    return { newSchema: schema, deterministicExplanation: `La colonne "${column.name}" existe déjà dans "${vd.name}", aucun changement.`, changed: false };
   }
 
   vd.extraColumns = [...(vd.extraColumns ?? []), { name: column.name, type: column.type }];
-  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === dimName ? vd : v));
+  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === vd.name ? vd : v));
 
   return {
     newSchema: schema,
-    deterministicExplanation: `Colonne "${column.name}" (${column.type}) ajoutée à la dimension "${dimName}".`,
+    deterministicExplanation: `Colonne "${column.name}" (${column.type}) ajoutée à la dimension "${vd.name}".`,
+    changed: true,
+  };
+}
+
+case 'rename_table': {
+  const oldName = action.oldName;
+  const newName = (action.newName && typeof action.newName === 'string' && action.newName.trim())
+    ? action.newName.trim()
+    : null;
+
+  if (!newName) {
+    return { newSchema: schema, deterministicExplanation: `Nouveau nom manquant, aucun changement.`, changed: false };
+  }
+
+  const isDimension = schema.dimensions?.includes(oldName);
+  const isFact = schema.facts?.includes(oldName);
+
+  if (!isDimension && !isFact) {
+    return { newSchema: schema, deterministicExplanation: `Table "${oldName}" introuvable, aucun changement.`, changed: false };
+  }
+
+  if (schema.dimensions?.includes(newName) || schema.facts?.includes(newName)) {
+    return { newSchema: schema, deterministicExplanation: `Le nom "${newName}" est déjà utilisé, aucun changement.`, changed: false };
+  }
+
+  // Empêche tout conflit avec le mécanisme automatique DimTemps
+  if (newName.toLowerCase().includes('dimtemps') || oldName.toLowerCase() === 'dimtemps') {
+    return { newSchema: schema, deterministicExplanation: `Impossible de renommer "${oldName}" : ce nom est réservé au mécanisme automatique de dimension temporelle.`, changed: false };
+  }
+
+  // Renomme dans dimensions / facts
+  schema.dimensions = (schema.dimensions ?? []).map((d: string) => (d === oldName ? newName : d));
+  schema.facts = (schema.facts ?? []).map((f: string) => (f === oldName ? newName : f));
+
+  // Renomme dans confirmedRelations / additionalRelations
+  const renameInRelations = (relations: any[]) =>
+    (relations ?? []).map((r: any) => ({
+      ...r,
+      tableA: r.tableA === oldName ? newName : r.tableA,
+      tableB: r.tableB === oldName ? newName : r.tableB,
+    }));
+  schema.confirmedRelations = renameInRelations(schema.confirmedRelations);
+  schema.additionalRelations = renameInRelations(schema.additionalRelations);
+
+  // Renomme dans virtualDimensions (nom + linkedFact)
+  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((vd: any) => ({
+    ...vd,
+    name: vd.name === oldName ? newName : vd.name,
+    linkedFact: vd.linkedFact === oldName ? newName : vd.linkedFact,
+  }));
+
+  // Renomme dans virtualFacts (nom + dimensionNames)
+  schema.virtualFacts = (schema.virtualFacts ?? []).map((vf: any) => ({
+    ...vf,
+    name: vf.name === oldName ? newName : vf.name,
+    dimensionNames: (vf.dimensionNames ?? []).map((d: string) => (d === oldName ? newName : d)),
+  }));
+
+  // Renomme dans subDimensions (parentDimension)
+  schema.subDimensions = (schema.subDimensions ?? []).map((sd: any) => ({
+    ...sd,
+    parentDimension: sd.parentDimension === oldName ? newName : sd.parentDimension,
+  }));
+
+  // Renomme dans factColumnTransformations (factTable)
+  schema.factColumnTransformations = (schema.factColumnTransformations ?? []).map((t: any) => ({
+    ...t,
+    factTable: t.factTable === oldName ? newName : t.factTable,
+  }));
+
+  // Renomme dans excludedColumns (clé)
+  if (schema.excludedColumns?.[oldName]) {
+    schema.excludedColumns = { ...schema.excludedColumns };
+    schema.excludedColumns[newName] = schema.excludedColumns[oldName];
+    delete schema.excludedColumns[oldName];
+  }
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `"${oldName}" renommée en "${newName}".`,
+    changed: true,
+  };
+}
+
+case 'rename_column': {
+  const tableName = action.table;
+  const oldColumn = action.oldColumn;
+  const newColumn = (action.newColumn && typeof action.newColumn === 'string' && action.newColumn.trim())
+    ? action.newColumn.trim()
+    : null;
+
+  if (!newColumn || typeof oldColumn !== 'string' || !oldColumn) {
+    return { newSchema: schema, deterministicExplanation: `Colonnes mal spécifiées, aucun changement.`, changed: false };
+  }
+
+  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name.toLowerCase() === String(tableName).toLowerCase());
+  if (!vd) {
+    return {
+      newSchema: schema,
+      deterministicExplanation: `"${tableName}" introuvable parmi les dimensions virtuelles, aucun changement. (Le renommage de colonne n'est supporté que pour les dimensions créées via le chat.)`,
+      changed: false,
+    };
+  }
+
+  const colIndex = (vd.extraColumns ?? []).findIndex((c: any) => c.name.toLowerCase() === oldColumn.toLowerCase());
+  if (colIndex === -1) {
+    return { newSchema: schema, deterministicExplanation: `Colonne "${oldColumn}" introuvable dans "${vd.name}", aucun changement.`, changed: false };
+  }
+
+  const alreadyExists = (vd.extraColumns ?? []).some((c: any, i: number) => i !== colIndex && c.name.toLowerCase() === newColumn.toLowerCase());
+  if (alreadyExists) {
+    return { newSchema: schema, deterministicExplanation: `La colonne "${newColumn}" existe déjà dans "${vd.name}", aucun changement.`, changed: false };
+  }
+
+  const updatedExtraColumns = [...vd.extraColumns];
+  updatedExtraColumns[colIndex] = { ...updatedExtraColumns[colIndex], name: newColumn };
+
+  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) =>
+    v.name === vd.name ? { ...v, extraColumns: updatedExtraColumns } : v,
+  );
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Colonne "${oldColumn}" renommée en "${newColumn}" dans "${vd.name}".`,
+    changed: true,
+  };
+}
+case 'change_column_type': {
+  const tableName = action.table;
+  const colName = action.column;
+  const newType = (action.newType && typeof action.newType === 'string' && action.newType.trim())
+    ? action.newType.trim()
+    : null;
+
+  if (!newType || typeof colName !== 'string' || !colName) {
+    return { newSchema: schema, deterministicExplanation: `Colonne ou type mal spécifié, aucun changement.`, changed: false };
+  }
+
+  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name.toLowerCase() === String(tableName).toLowerCase());
+  if (!vd) {
+    return {
+      newSchema: schema,
+      deterministicExplanation: `"${tableName}" introuvable parmi les dimensions virtuelles, aucun changement. (Le changement de type n'est supporté que pour les dimensions créées via le chat.)`,
+      changed: false,
+    };
+  }
+
+  const colIndex = (vd.extraColumns ?? []).findIndex((c: any) => c.name.toLowerCase() === colName.toLowerCase());
+  if (colIndex === -1) {
+    return { newSchema: schema, deterministicExplanation: `Colonne "${colName}" introuvable dans "${vd.name}" (ou il s'agit de la clé primaire, non modifiable), aucun changement.`, changed: false };
+  }
+
+  const currentType = vd.extraColumns[colIndex].type;
+  if (currentType.toUpperCase() === newType.toUpperCase()) {
+    return { newSchema: schema, deterministicExplanation: `La colonne "${colName}" est déjà de type "${newType}", aucun changement.`, changed: false };
+  }
+
+  const updatedExtraColumns = [...vd.extraColumns];
+  updatedExtraColumns[colIndex] = { ...updatedExtraColumns[colIndex], type: newType };
+
+  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) =>
+    v.name === vd.name ? { ...v, extraColumns: updatedExtraColumns } : v,
+  );
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Type de la colonne "${colName}" changé de "${currentType}" à "${newType}" dans "${vd.name}".`,
     changed: true,
   };
 }
@@ -2305,11 +2473,19 @@ private buildChatPrompt(currentSchema: any, userMessage: string, recentExchanges
     .map((sd: any) => `${sd.name}(from ${sd.parentDimension}.${sd.sourceColumn})`)
     .join('; ');
 
+  const virtualDimColumns = (currentSchema.virtualDimensions ?? [])
+    .map((vd: any) => {
+      const cols = [`${vd.name}Id (clé primaire, ne jamais renommer/supprimer/changer le type)`, ...(vd.extraColumns ?? []).map((c: any) => `${c.name} (${c.type})`)];
+      return `${vd.name}: ${cols.join(', ')}`;
+    })
+    .join(' | ');
+
   return `You manage a data warehouse schema. Current state:
 Dimensions: ${dims || 'none'}
 Facts: ${facts || 'none'}
 Relations: ${relations || 'none'}
 Sub-dimensions: ${subDims || 'none'}
+Virtual dimension columns (EXACT names, use these ONLY): ${virtualDimColumns || 'none'}
 ${historyBlock}
 User message: "${userMessage}"
 
@@ -2338,15 +2514,18 @@ Available actions for ACTUAL modifications:
 - {"action":"create_dimension","name":"DimName","linkedFact":"FactName","columns":[{"name":"colName","type":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)"}],"reply":"..."} — create a NEW empty dimension table linked to an EXISTING fact table. "columns" is OPTIONAL: only include extra columns explicitly requested by the user (besides the automatic primary key). Map data types mentioned in French to SQL types (e.g. "salaire"/"montant" -> DECIMAL(18,4), "nombre"/"entier" -> INT, "texte"/"nom" -> VARCHAR(255), "date" -> DATE).
 - {"action":"remove_dimension_column","dimension":"DimName","column":"colName","reply":"..."} — remove an extra column from a virtual dimension (never removes the automatic primary key)
 - {"action":"add_dimension_column","dimension":"DimName","columnName":"colName","columnType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — add a new column to an EXISTING virtual dimension.
+- {"action":"rename_table","oldName":"OldName","newName":"NewName","reply":"..."} — rename an EXISTING dimension or fact table (virtual or real). "oldName" must be an EXACT name from the lists above.
+- {"action":"rename_column","table":"DimName","oldColumn":"oldColName","newColumn":"newColName","reply":"..."} — rename a column in an EXISTING virtual dimension (created via create_dimension/add_dimension_column). Never use this for a real staging table's column — refuse with "answer_question" instead and explain it's not supported.
+- {"action":"change_column_type","table":"DimName","column":"colName","newType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — change the SQL type of an EXISTING column in a virtual dimension. "column" MUST be an EXACT name from "Virtual dimension columns" above (never the automatic primary key). Never use this for a real staging table's column — refuse with "answer_question" instead.
 
 Rules:
 - "table"/"name" must be an EXACT name from the lists above. If it does not match exactly, use "answer_question" instead and explain the name was not found.
+- For "rename_column", "remove_dimension_column", "add_dimension_column", "change_column_type": "oldColumn"/"column" MUST be an EXACT name from "Virtual dimension columns" above. If you cannot find the exact column name there, use "answer_question" instead and explain which column names actually exist.
 - Never touch "DimTemps" or its relations.
 - "reply" is a short, natural sentence in French.
 
 ⚠️ Reply ONLY with valid JSON for ONE action, nothing else.`;
 }
-
   private computeDiffExplanation(oldSchema: any, newSchema: any): string {
   const changes: string[] = [];
 
@@ -2609,8 +2788,7 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
   // (ex: "et dimstoreregion aussi ?", "pourquoi pas ?", "attention X n'est pas lié à Y")
   // -> traitée comme une clarification informative, avec contexte + historique,
   // mais SANS jamais déclencher d'action de modification.
-  const ACTION_VERBS = ['retir', 'supprim', 'enlev', 'ajout', 'ajoute', 'deplac', 'déplac', 'transform', 'cree', 'crée', 'change', 'modifi'];
-  const messageHasActionVerb = ACTION_VERBS.some((v) => userMessage.toLowerCase().includes(v));
+const ACTION_VERBS = ['retir', 'supprim', 'enlev', 'ajout', 'ajoute', 'deplac', 'déplac', 'transform', 'cree', 'crée', 'change', 'modifi', 'renomm'];  const messageHasActionVerb = ACTION_VERBS.some((v) => userMessage.toLowerCase().includes(v));
 
   if (!messageHasActionVerb) {
     const historyBlock = this.formatRecentHistory(recentExchanges);
