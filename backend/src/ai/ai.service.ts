@@ -1867,9 +1867,11 @@ return {
 // Réponds STRICTEMENT en JSON avec ce format :
 // {"reply":"ta réponse conversationnelle à l'utilisateur","schemaChanged":false,"dimensions":[],"facts":[],"confirmedRelations":[],"subDimensions":[]}`;
 // }
+
 private applyChatAction(
   currentSchema: any,
   action: any,
+  userMessage: string,
 ): { newSchema: any; deterministicExplanation: string; changed: boolean } {
   const schema = JSON.parse(JSON.stringify(currentSchema)); // clone profond, on ne touche rien d'autre
 
@@ -2115,9 +2117,22 @@ case 'create_dimension': {
 
   const realFactName = (schema.facts ?? []).find((f: string) => this.stripPrefix(f) === linkedFact);
 
-  const extraColumns = Array.isArray(action.columns)
-    ? action.columns.filter((c: any) => c && typeof c.name === 'string' && typeof c.type === 'string')
-    : [];
+  // ✅ Garde-fou anti-hallucination : on ne garde une colonne proposée par le modèle
+// que si son nom apparaît réellement (même approximativement) dans le message utilisateur,
+// pour éviter qu'il invente des colonnes non demandées.
+const rawExtraColumns = Array.isArray(action.columns)
+  ? action.columns.filter((c: any) => c && typeof c.name === 'string' && typeof c.type === 'string')
+  : [];
+
+const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+const normalizedMessage = normalize(userMessage);
+
+const extraColumns = rawExtraColumns.filter((c: any) => normalizedMessage.includes(normalize(c.name)));
+
+const rejectedColumns = rawExtraColumns.filter((c: any) => !normalizedMessage.includes(normalize(c.name)));
+if (rejectedColumns.length > 0) {
+  console.warn(`[applyChatAction] Colonnes rejetées (non mentionnées dans le message): ${rejectedColumns.map((c: any) => c.name).join(', ')}`);
+}
 
   schema.dimensions = [...(schema.dimensions ?? []), dimName];
   schema.virtualDimensions = [
@@ -2143,6 +2158,66 @@ case 'create_dimension': {
   return {
     newSchema: schema,
     deterministicExplanation: `Dimension "${dimName}" créée (vide, à peupler manuellement) et reliée à "${linkedFact}".${columnsNote}`,
+    changed: true,
+  };
+}
+case 'remove_dimension_column': {
+  const dimName = action.dimension;
+  const colName = action.column;
+
+  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name === dimName);
+  if (!vd) {
+    return { newSchema: schema, deterministicExplanation: `Dimension virtuelle "${dimName}" introuvable, aucun changement.`, changed: false };
+  }
+
+  const before = (vd.extraColumns ?? []).length;
+  vd.extraColumns = (vd.extraColumns ?? []).filter((c: any) => c.name.toLowerCase() !== String(colName).toLowerCase());
+  const changed = vd.extraColumns.length !== before;
+
+  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === dimName ? vd : v));
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: changed
+      ? `Colonne "${colName}" supprimée de la dimension "${dimName}".`
+      : `Colonne "${colName}" introuvable dans "${dimName}", aucun changement.`,
+    changed,
+  };
+}
+
+case 'add_dimension_column': {
+  const dimName = action.dimension;
+  const column = { name: action.columnName, type: action.columnType };
+
+  if (typeof column.name !== 'string' || typeof column.type !== 'string' || !column.name || !column.type) {
+    return { newSchema: schema, deterministicExplanation: `Colonne mal spécifiée, aucun changement.`, changed: false };
+  }
+
+  // ✅ Même garde-fou anti-hallucination que create_dimension : le nom de la colonne
+  // doit réellement apparaître dans le message utilisateur.
+  const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+  const normalizedMessage = normalize(userMessage);
+  if (!normalizedMessage.includes(normalize(column.name))) {
+    console.warn(`[applyChatAction] Colonne "${column.name}" rejetée : non mentionnée dans le message "${userMessage}"`);
+    return { newSchema: schema, deterministicExplanation: `Impossible de confirmer la colonne "${column.name}" à partir du message, aucun changement.`, changed: false };
+  }
+
+  const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name === dimName);
+  if (!vd) {
+    return { newSchema: schema, deterministicExplanation: `Dimension virtuelle "${dimName}" introuvable, aucun changement.`, changed: false };
+  }
+
+  const alreadyExists = (vd.extraColumns ?? []).some((c: any) => c.name.toLowerCase() === column.name.toLowerCase());
+  if (alreadyExists) {
+    return { newSchema: schema, deterministicExplanation: `La colonne "${column.name}" existe déjà dans "${dimName}", aucun changement.`, changed: false };
+  }
+
+  vd.extraColumns = [...(vd.extraColumns ?? []), { name: column.name, type: column.type }];
+  schema.virtualDimensions = (schema.virtualDimensions ?? []).map((v: any) => (v.name === dimName ? vd : v));
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Colonne "${column.name}" (${column.type}) ajoutée à la dimension "${dimName}".`,
     changed: true,
   };
 }
@@ -2232,6 +2307,8 @@ Available actions for ACTUAL modifications:
 - {"action":"remove_subdimension","name":"DimX","reply":"..."}
 - {"action":"create_fact_table","name":"FactName","dimensions":["Dim1","Dim2"],"reply":"..."} — create a NEW empty fact table with foreign keys to the listed dimensions (dimensions must be EXACT names from the list above, at least 2)
 - {"action":"create_dimension","name":"DimName","linkedFact":"FactName","columns":[{"name":"colName","type":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)"}],"reply":"..."} — create a NEW empty dimension table linked to an EXISTING fact table. "columns" is OPTIONAL: only include extra columns explicitly requested by the user (besides the automatic primary key). Map data types mentioned in French to SQL types (e.g. "salaire"/"montant" -> DECIMAL(18,4), "nombre"/"entier" -> INT, "texte"/"nom" -> VARCHAR(255), "date" -> DATE).
+- {"action":"remove_dimension_column","dimension":"DimName","column":"colName","reply":"..."} — remove an extra column from a virtual dimension (never removes the automatic primary key)
+- {"action":"add_dimension_column","dimension":"DimName","columnName":"colName","columnType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — add a new column to an EXISTING virtual dimension.
 
 Rules:
 - "table"/"name" must be an EXACT name from the lists above. If it does not match exactly, use "answer_question" instead and explain the name was not found.
@@ -2548,9 +2625,28 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
     try {
       const rawResponse = await this.callOllama(prompt);
-      const cleaned = rawResponse.replace(/```json|```/g, '').trim();
-      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-      const action = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);
+let cleaned = rawResponse.replace(/```json|```/g, '').trim();
+const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+cleaned = jsonMatch ? jsonMatch[0] : cleaned;
+
+let action: any;
+try {
+  action = JSON.parse(cleaned);
+} catch (parseErr) {
+  // Réparations basiques courantes chez les petits modèles : virgule manquante entre
+  // deux propriétés, virgule finale avant une accolade/crochet fermante.
+  const repaired = cleaned
+    .replace(/"\s*\n?\s*"/g, '", "')           // guillemet suivi directement d'un guillemet -> virgule manquante
+    .replace(/,\s*([}\]])/g, '$1')              // virgule juste avant } ou ] -> supprimée
+    .replace(/}\s*{/g, '}, {');                 // deux objets collés -> virgule entre eux
+
+  try {
+    action = JSON.parse(repaired);
+  } catch (secondErr) {
+    console.warn(`[applyChatModification] JSON action illisible même après réparation: ${cleaned.substring(0, 300)}`);
+    throw parseErr; // relance l'erreur d'origine, la boucle MAX_RETRIES retentera
+  }
+}
 
       const REMOVAL_KEYWORDS = ['retir', 'supprim', 'enlev', 'remov', 'delete', 'drop'];
       const isRemovalAction = action.action?.startsWith('remove_');
@@ -2573,7 +2669,7 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
         };
       }
 
-      const { newSchema, deterministicExplanation, changed } = this.applyChatAction(internalCurrentSchema, action);
+const { newSchema, deterministicExplanation, changed } = this.applyChatAction(internalCurrentSchema, action, userMessage);
 
       if (!changed) {
         return {
