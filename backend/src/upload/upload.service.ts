@@ -645,10 +645,11 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
   const facts = (rawSchema.facts ?? []).map(stripPrefix);
 
   // Faits et dimensions virtuels : à transmettre à .NET et à exclure de la lecture staging
-  const virtualFacts = (rawSchema.virtualFacts ?? []).map((vf: any) => ({
-    name: stripPrefix(vf.name),
-    dimensionNames: (vf.dimensionNames ?? []).map(stripPrefix),
-  }));
+ const virtualFacts = (rawSchema.virtualFacts ?? []).map((vf: any) => ({
+  name: stripPrefix(vf.name),
+  dimensionNames: (vf.dimensionNames ?? []).map(stripPrefix),
+  measures: vf.measures ?? [],
+}));
   const virtualFactNames = new Set(virtualFacts.map((vf: any) => vf.name));
   const virtualDimNames = new Set((rawSchema.virtualDimensions ?? []).map((vd: any) => stripPrefix(vd.name)));
 

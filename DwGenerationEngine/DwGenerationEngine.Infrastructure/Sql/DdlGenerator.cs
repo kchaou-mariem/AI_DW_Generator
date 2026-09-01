@@ -94,13 +94,20 @@ public class DdlGenerator : IDdlGenerator
                 result.CreatedTables.Add(sd.Name);
             }
 
-            foreach (var dimName in schema.Dimensions)
+           foreach (var dimName in schema.Dimensions)
             {
-                var attributes = schema.TableAttributes.GetValueOrDefault(dimName, new List<TableAttribute>());
-                var subDimsForThisTable = schema.SubDimensions
-                    .Where(sd => sd.ParentDimension == dimName)
-                    .ToList();
-                var sql = BuildSimpleTableCreateScript(dimName, attributes, subDimsForThisTable);
+                var virtualDim = schema.VirtualDimensions.FirstOrDefault(vd => vd.Name == dimName);
+                string sql;
+                if (virtualDim != null)
+                {
+                    sql = BuildVirtualDimensionCreateScript(virtualDim);
+                }
+                else
+                {
+                    var attributes = schema.TableAttributes.GetValueOrDefault(dimName, new List<TableAttribute>());
+                    var subDimsForThisTable = schema.SubDimensions.Where(sd => sd.ParentDimension == dimName).ToList();
+                    sql = BuildSimpleTableCreateScript(dimName, attributes, subDimsForThisTable);
+                }
                 await ExecuteNonQueryAsync(connection, sql);
                 result.ExecutedScripts.Add(sql);
                 result.CreatedTables.Add(dimName);
@@ -309,6 +316,10 @@ private static string BuildVirtualFactTableCreateScript(VirtualFact vf)
     columnDefs.AddRange(
         vf.DimensionNames.Select(dim =>
             $"    [{dim}Id] INT NULL FOREIGN KEY REFERENCES [dbo].[{dim}]([{dim}Id])")
+    );
+
+    columnDefs.AddRange(
+        vf.Measures.Select(m => $"    [{m.Name}] {m.Type} NULL")
     );
 
     sb.AppendLine(string.Join(",\n", columnDefs));

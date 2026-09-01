@@ -67,6 +67,7 @@ public class VirtualFact
 {
     public required string Name { get; set; }
     public List<string> DimensionNames { get; set; } = new();
+    public List<TableAttribute> Measures { get; set; } = new();
 }
 
 public class VirtualDimension

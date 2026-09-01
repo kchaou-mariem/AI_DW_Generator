@@ -22,12 +22,13 @@ public static class DwTableSchemaResolver
         }
 
         var virtualFact = schema.VirtualFacts.FirstOrDefault(vf => vf.Name == tableName);
-        if (virtualFact != null)
-        {
-            var columns = new List<ResolvedColumn> { new($"{tableName}Id", "INT") };
-            columns.AddRange(virtualFact.DimensionNames.Select(dim => new ResolvedColumn($"{dim}Id", "INT")));
-            return columns;
-        }
+if (virtualFact != null)
+{
+    var columns = new List<ResolvedColumn> { new($"{tableName}Id", "INT") };
+    columns.AddRange(virtualFact.DimensionNames.Select(dim => new ResolvedColumn($"{dim}Id", "INT")));
+    columns.AddRange(virtualFact.Measures.Select(m => new ResolvedColumn(m.Name, m.Type)));
+    return columns;
+}
 
         var generatedDim = schema.GeneratedDimensions.FirstOrDefault(gd => gd.Name == tableName);
         if (generatedDim != null)

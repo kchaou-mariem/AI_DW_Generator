@@ -30,9 +30,11 @@ export interface SubDimension {
   sourceColumn: string;
   generatedPrimaryKey: string;
 }
+
 export interface VirtualFact {
   name: string;
   dimensionNames: string[];
+  measures?: { name: string; type: string }[];
 }
 
 export interface VirtualDimension {
@@ -256,12 +258,13 @@ private buildTableAttributes(
     ];
   }
 
-  for (const vf of virtualFacts) {
-    attributes[vf.name] = [
-      { name: `${vf.name}Id`, type: 'INT' },
-      ...vf.dimensionNames.map((d: string) => ({ name: `${d}Id`, type: 'INT' })),
-    ];
-  }
+ for (const vf of virtualFacts) {
+  attributes[vf.name] = [
+    { name: `${vf.name}Id`, type: 'INT' },
+    ...vf.dimensionNames.map((d: string) => ({ name: `${d}Id`, type: 'INT' })),
+    ...(vf.measures ?? []),
+  ];
+}
 
   for (const vd of virtualDimensions) {
     attributes[vd.name] = [
@@ -2082,14 +2085,21 @@ case 'create_fact_table': {
   let dimensions: string[] = Array.isArray(action.dimensions) ? action.dimensions : [];
   dimensions = dimensions.map((d: string) => this.stripPrefix(d));
 
-  // ✅ NOUVEAU : schema.dimensions peut être préfixé (staging_) à ce stade,
-  // on compare donc sur des versions sans préfixe des deux côtés.
   const schemaDimensionsStripped = (schema.dimensions ?? []).map((d: string) => this.stripPrefix(d));
 
-  let validDimensions = dimensions.filter((d: string) => schemaDimensionsStripped.includes(d));
+  // ✅ CORRIGÉ : correspondance insensible à la casse/espaces, au lieu d'une comparaison stricte,
+  // pour éviter que "Product" (au lieu de "Products") ne fasse basculer sur TOUTES les dimensions.
+  const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+  let validDimensions = dimensions
+    .map((d: string) => schemaDimensionsStripped.find((real: string) => normalize(real) === normalize(d)))
+    .filter((d): d is string => d !== undefined);
+
+  // Dédoublonne au cas où le modèle aurait listé deux fois la même dimension
+  validDimensions = [...new Set(validDimensions)];
 
   if (validDimensions.length < 2) {
-    validDimensions = [...schemaDimensionsStripped]; // ✅ fallback aussi nettoyé du préfixe
+    console.warn(`[applyChatAction] create_fact_table: dimensions demandées non reconnues (${dimensions.join(', ')}) — fallback sur toutes les dimensions du schéma.`);
+    validDimensions = [...schemaDimensionsStripped];
   }
 
   if (validDimensions.length < 2) {
@@ -2100,25 +2110,38 @@ case 'create_fact_table': {
     };
   }
 
-  // const factName = (action.name && typeof action.name === 'string' && action.name.trim())
-  //   ? action.name.trim()
-  //   : 'Fact';
-  // Le nom par défaut est toujours "Fact" (ou "Fact2", "Fact3"... si déjà utilisé),
-// sauf si l'utilisateur a explicitement précisé un nom dans son message d'origine
-// (détecté via un mot-clé "nommé"/"appelé"/"named" dans le message, pas dans le JSON du modèle).
-let factName = 'Fact';
-let suffix = 2;
-while (schema.facts?.includes(factName) || schema.dimensions?.includes(factName)) {
-  factName = `Fact${suffix}`;
-  suffix++;
-}
+  // ✅ CORRIGÉ : utilise le nom demandé par l'utilisateur s'il est fourni et disponible,
+  // sinon retombe sur la génération automatique "Fact"/"Fact2"/...
+  let factName: string;
+  const requestedName = (action.name && typeof action.name === 'string' && action.name.trim())
+    ? action.name.trim()
+    : null;
 
-  if (schema.facts?.includes(factName) || schema.dimensions?.includes(factName)) {
-    return { newSchema: schema, deterministicExplanation: `Le nom "${factName}" est déjà utilisé, aucun changement.`, changed: false };
+  if (requestedName && !schema.facts?.includes(requestedName) && !schema.dimensions?.includes(requestedName)) {
+    factName = requestedName;
+  } else if (requestedName) {
+    return { newSchema: schema, deterministicExplanation: `Le nom "${requestedName}" est déjà utilisé, aucun changement.`, changed: false };
+  } else {
+    factName = 'Fact';
+    let suffix = 2;
+    while (schema.facts?.includes(factName) || schema.dimensions?.includes(factName)) {
+      factName = `Fact${suffix}`;
+      suffix++;
+    }
+  }
+
+  const rawMeasures = Array.isArray(action.measures)
+    ? action.measures.filter((m: any) => m && typeof m.name === 'string' && typeof m.type === 'string')
+    : [];
+  const normalizedMessage = normalize(userMessage);
+  const measures = rawMeasures.filter((m: any) => normalizedMessage.includes(normalize(m.name)));
+  const rejectedMeasures = rawMeasures.filter((m: any) => !normalizedMessage.includes(normalize(m.name)));
+  if (rejectedMeasures.length > 0) {
+    console.warn(`[applyChatAction] Mesures rejetées (non mentionnées dans le message): ${rejectedMeasures.map((m: any) => m.name).join(', ')}`);
   }
 
   schema.facts = [...(schema.facts ?? []), factName];
-  schema.virtualFacts = [...(schema.virtualFacts ?? []), { name: factName, dimensionNames: validDimensions }];
+  schema.virtualFacts = [...(schema.virtualFacts ?? []), { name: factName, dimensionNames: validDimensions, measures }];
 
   const newRelations = validDimensions.map((dim: string) => ({
     tableA: factName,
@@ -2129,12 +2152,18 @@ while (schema.facts?.includes(factName) || schema.dimensions?.includes(factName)
   }));
   schema.confirmedRelations = [...(schema.confirmedRelations ?? []), ...newRelations];
 
+  const measuresNote = measures.length > 0
+    ? ` Mesures ajoutées : ${measures.map((m: any) => `${m.name} (${m.type})`).join(', ')}.`
+    : '';
+
   return {
     newSchema: schema,
-    deterministicExplanation: `Table de fait "${factName}" créée avec des clés étrangères vers ${validDimensions.join(', ')}. Elle est vide (aucune source de données) — à peupler manuellement plus tard.`,
+    deterministicExplanation: `Table de fait "${factName}" créée avec des clés étrangères vers ${validDimensions.join(', ')}.${measuresNote} Elle est vide (aucune source de données) — à peupler manuellement plus tard.`,
     changed: true,
   };
-}case 'create_dimension': {
+}
+
+case 'create_dimension': {
   const dimName = (action.name && typeof action.name === 'string' && action.name.trim())
     ? action.name.trim()
     : null;
@@ -2507,6 +2536,83 @@ case 'rename_real_column': {
     changed: true,
   };
 }
+
+case 'add_fact_column': {
+  const factName = action.fact;
+  const column = { name: action.columnName, type: action.columnType };
+
+  if (typeof column.name !== 'string' || typeof column.type !== 'string' || !column.name || !column.type) {
+    return { newSchema: schema, deterministicExplanation: `Colonne mal spécifiée, aucun changement.`, changed: false };
+  }
+
+  const vf = (schema.virtualFacts ?? []).find((v: any) => v.name.toLowerCase() === String(factName).toLowerCase());
+  if (!vf) {
+    return { newSchema: schema, deterministicExplanation: `Fait virtuel "${factName}" introuvable, aucun changement.`, changed: false };
+  }
+
+  const alreadyExists = (vf.measures ?? []).some((c: any) => c.name.toLowerCase() === column.name.toLowerCase())
+    || vf.dimensionNames.some((d: string) => `${d}Id`.toLowerCase() === column.name.toLowerCase());
+  if (alreadyExists) {
+    return { newSchema: schema, deterministicExplanation: `La colonne "${column.name}" existe déjà dans "${vf.name}", aucun changement.`, changed: false };
+  }
+
+  vf.measures = [...(vf.measures ?? []), { name: column.name, type: column.type }];
+  schema.virtualFacts = (schema.virtualFacts ?? []).map((v: any) => (v.name === vf.name ? vf : v));
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Colonne de mesure "${column.name}" (${column.type}) ajoutée au fait "${vf.name}".`,
+    changed: true,
+  };
+}
+case 'rename_fact_measure': {
+  const factName = action.fact;
+  const oldColumn = action.oldColumn;
+  const newColumn = (action.newColumn && typeof action.newColumn === 'string' && action.newColumn.trim())
+    ? action.newColumn.trim()
+    : null;
+  const newType = (action.newType && typeof action.newType === 'string' && action.newType.trim())
+    ? action.newType.trim()
+    : null;
+
+  if (!newColumn && !newType) {
+    return { newSchema: schema, deterministicExplanation: `Ni nouveau nom ni nouveau type fourni, aucun changement.`, changed: false };
+  }
+  if (typeof oldColumn !== 'string' || !oldColumn) {
+    return { newSchema: schema, deterministicExplanation: `Colonne d'origine mal spécifiée, aucun changement.`, changed: false };
+  }
+
+  const vf = (schema.virtualFacts ?? []).find((v: any) => v.name.toLowerCase() === String(factName).toLowerCase());
+  if (!vf) {
+    return { newSchema: schema, deterministicExplanation: `Fait virtuel "${factName}" introuvable, aucun changement.`, changed: false };
+  }
+
+  const measureIndex = (vf.measures ?? []).findIndex((m: any) => m.name.toLowerCase() === oldColumn.toLowerCase());
+  if (measureIndex === -1) {
+    return { newSchema: schema, deterministicExplanation: `Mesure "${oldColumn}" introuvable dans "${vf.name}", aucun changement.`, changed: false };
+  }
+
+  const finalNewName = newColumn ?? vf.measures[measureIndex].name;
+  const finalNewType = newType ?? vf.measures[measureIndex].type;
+
+  const updatedMeasures = [...vf.measures];
+  updatedMeasures[measureIndex] = { name: finalNewName, type: finalNewType };
+
+  schema.virtualFacts = (schema.virtualFacts ?? []).map((v: any) =>
+    v.name === vf.name ? { ...v, measures: updatedMeasures } : v,
+  );
+
+  const parts: string[] = [];
+  if (newColumn) parts.push(`renommée en "${finalNewName}"`);
+  if (newType) parts.push(`type changé en "${finalNewType}"`);
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Mesure "${oldColumn}" de "${vf.name}" ${parts.join(' et ')}.`,
+    changed: true,
+  };
+}
+
     default:
       return { newSchema: schema, deterministicExplanation: '', changed: false };
   }
@@ -2568,7 +2674,17 @@ private buildChatPrompt(currentSchema: any, userMessage: string, recentExchanges
     })
     .join(' | ');
 
-  // ✅ Colonnes exactes des tables réelles (staging), nécessaire pour "rename_real_column"
+  const virtualFactColumns = (currentSchema.virtualFacts ?? [])
+    .map((vf: any) => {
+      const cols = [
+        `${vf.name}Id (clé primaire, ne jamais modifier)`,
+        ...(vf.dimensionNames ?? []).map((d: string) => `${d}Id (clé étrangère vers ${d}, ne jamais modifier)`),
+        ...(vf.measures ?? []).map((m: any) => `${m.name} (${m.type})`),
+      ];
+      return `${vf.name}: ${cols.join(', ')}`;
+    })
+    .join(' | ');
+
   const virtualNames = new Set([
     ...(currentSchema.virtualDimensions ?? []).map((vd: any) => vd.name),
     ...(currentSchema.virtualFacts ?? []).map((vf: any) => vf.name),
@@ -2584,6 +2700,7 @@ Facts: ${facts || 'none'}
 Relations: ${relations || 'none'}
 Sub-dimensions: ${subDims || 'none'}
 Virtual dimension columns (EXACT names, use these ONLY): ${virtualDimColumns || 'none'}
+Virtual fact columns (EXACT names, use these ONLY for add_fact_column): ${virtualFactColumns || 'none'}
 Real table columns from staging (EXACT names, use these ONLY): ${realTableColumns || 'none'}
 ${historyBlock}
 User message: "${userMessage}"
@@ -2593,6 +2710,8 @@ User message: "${userMessage}"
 If it is a QUESTION or you are not 100% sure it is a modification request targeting an EXISTING element listed above: use {"action":"answer_question","reply":"your answer in French"}.
 
 ⚠️ NEVER use "remove_subdimension", "remove_dimension" or "remove_fact" unless the user explicitly names a table/sub-dimension that appears in the lists above, AND clearly asks to remove/delete it.
+
+⚠️ CRITICAL: "crée/créer une [nouvelle] table de fait [nommée X]" is ALWAYS "create_fact_table", NEVER "add_fact_column" — even if the message also mentions a measure name. Example: "crée un fait Ventes relié à Products et Resellers avec une mesure Montant en décimal" -> {"action":"create_fact_table","name":"Ventes","dimensions":["Products","Resellers"],"measures":[{"name":"Montant","type":"DECIMAL(18,4)"}],"reply":"..."}. Use "add_fact_column" ONLY when the user refers to a fact table that ALREADY appears in "Facts" above, without asking to create a new one.
 
 Examples of what "answer_question" is for (do NOT touch the schema for these):
 - "what is a star schema?" -> answer_question
@@ -2609,7 +2728,8 @@ Available actions for ACTUAL modifications:
 - {"action":"add_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
 - {"action":"remove_relation","tableA":"X","columnA":"colX","tableB":"Y","columnB":"colY","reply":"..."}
 - {"action":"remove_subdimension","name":"DimX","reply":"..."}
-- {"action":"create_fact_table","name":"FactName","dimensions":["Dim1","Dim2"],"reply":"..."} — create a NEW empty fact table with foreign keys to the listed dimensions (dimensions must be EXACT names from the list above, at least 2)
+- {"action":"create_fact_table","name":"FactName","dimensions":["Dim1","Dim2"],"measures":[{"name":"measureName","type":"INT|DECIMAL(18,4)"}],"reply":"..."} — create a NEW empty fact table with foreign keys to the listed dimensions (at least 2, EXACT names from the list above). "measures" is OPTIONAL: only include numeric measure columns explicitly requested by the user (e.g. "montant"/"prix"/"chiffre d'affaires" -> DECIMAL(18,4), "quantité"/"nombre" -> INT).
+- {"action":"add_fact_column","fact":"FactName","columnName":"colName","columnType":"INT|DECIMAL(18,4)","reply":"..."} — add a new numeric measure column to an EXISTING virtual fact table. "fact" must be an EXACT name from "Virtual fact columns" above.
 - {"action":"create_dimension","name":"DimName","linkedFact":"FactName","columns":[{"name":"colName","type":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)"}],"reply":"..."} — create a NEW empty dimension table linked to an EXISTING fact table. "columns" is OPTIONAL: only include extra columns explicitly requested by the user (besides the automatic primary key). Map data types mentioned in French to SQL types (e.g. "salaire"/"montant" -> DECIMAL(18,4), "nombre"/"entier" -> INT, "texte"/"nom" -> VARCHAR(255), "date" -> DATE).
 - {"action":"remove_dimension_column","dimension":"DimName","column":"colName","reply":"..."} — remove an extra column from a VIRTUAL dimension only (never removes the automatic primary key)
 - {"action":"add_dimension_column","dimension":"DimName","columnName":"colName","columnType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — add a new column to an EXISTING virtual dimension.
@@ -2842,6 +2962,96 @@ private formatRecentHistory(recentExchanges: { user: string; ai: string }[]): st
   return `\nRecent conversation (for context, e.g. to understand "also", "why not", follow-ups):\n${lines}\n`;
 }
 
+/**
+ * Détecte de façon déterministe (regex, pas de LLM) une intention de création de fait
+ * dans le message utilisateur, et en extrait le nom, les dimensions citées et les mesures.
+ * Retourne null si le message ne ressemble pas à une demande de création de fait.
+ */
+private extractFactCreationHint(
+  userMessage: string,
+  schema: any,
+): { name: string | null; dimensions: string[]; measures: { name: string; type: string }[] } | null {
+  const CREATION_PATTERN = /(?:cr[ée]e?r?|ajoute)\s+(?:une\s+)?(?:nouvelle\s+)?(?:table\s+de\s+)?fait/i;
+  if (!CREATION_PATTERN.test(userMessage)) return null;
+
+  // --- Nom du fait : "nommée X", "appelé X", "named X" ---
+  const nameMatch = userMessage.match(/(?:nomm[ée]e?|appel[ée]e?|named)\s+["']?([A-Za-zÀ-ÿ0-9_]+)["']?/i);
+  const name = nameMatch ? nameMatch[1] : null;
+
+  // --- Dimensions : cherche chaque nom de dimension existante comme sous-chaîne du message ---
+  const schemaDimensionsStripped: string[] = (schema.dimensions ?? []).map((d: string) => this.stripPrefix(d));
+  const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+  const normalizedMessage = normalize(userMessage);
+  const dimensions = schemaDimensionsStripped.filter((d) => normalizedMessage.includes(normalize(d)));
+
+  // --- Mesures : "mesure X en TYPE" (accepte decimal/décimal/entier/int/texte/date) ---
+  const typeMap: Record<string, string> = {
+    decimal: 'DECIMAL(18,4)',
+    décimal: 'DECIMAL(18,4)',
+    montant: 'DECIMAL(18,4)',
+    entier: 'INT',
+    int: 'INT',
+    nombre: 'INT',
+    texte: 'VARCHAR(255)',
+    date: 'DATE',
+  };
+  const measures: { name: string; type: string }[] = [];
+  const measureRegex = /mesure\s+([A-Za-zÀ-ÿ0-9_]+)\s+en\s+([A-Za-zÀ-ÿ]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = measureRegex.exec(userMessage)) !== null) {
+    const measureName = m[1];
+    const rawType = m[2].toLowerCase();
+    const sqlType = typeMap[rawType] ?? 'DECIMAL(18,4)';
+    measures.push({ name: measureName, type: sqlType });
+  }
+
+  return { name, dimensions, measures };
+}
+/**
+ * Détecte de façon déterministe (regex, pas de LLM) une intention d'ajout de mesure
+ * à un fait EXISTANT. Retourne null si le message ne correspond pas à ce pattern.
+ */
+private extractAddFactColumnHint(
+  userMessage: string,
+  schema: any,
+): { fact: string; columnName: string; columnType: string } | null {
+  const ADD_MEASURE_PATTERN = /ajoute\s+(?:la\s+)?mesure/i;
+  if (!ADD_MEASURE_PATTERN.test(userMessage)) return null;
+
+  const virtualFacts: any[] = schema.virtualFacts ?? [];
+  if (virtualFacts.length === 0) return null;
+
+  const normalize = (s: string) =>
+    s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[_\s-]/g, '');
+  const normalizedMessage = normalize(userMessage);
+
+  // Trouve quel fait EXISTANT est cité dans le message
+  const matchedFact = virtualFacts.find((vf) => normalizedMessage.includes(normalize(vf.name)));
+  if (!matchedFact) return null;
+
+  // Nom de la mesure : "mesure X" ou "mesure nommée X" ou "mesure appelée X"
+  const nameMatch = userMessage.match(/mesure\s+(?:nomm[ée]e?\s+|appel[ée]e?\s+)?["']?([A-Za-zÀ-ÿ0-9_]+)["']?/i);
+  if (!nameMatch) return null;
+  const columnName = nameMatch[1];
+
+  // Type : "de type X" ou "en X"
+  const typeMap: Record<string, string> = {
+    decimal: 'DECIMAL(18,4)',
+    décimal: 'DECIMAL(18,4)',
+    montant: 'DECIMAL(18,4)',
+    entier: 'INT',
+    int: 'INT',
+    nombre: 'INT',
+    texte: 'VARCHAR(255)',
+    date: 'DATE',
+  };
+  const typeMatch = userMessage.match(/(?:de\s+type|en)\s+([A-Za-zÀ-ÿ]+)/i);
+  const rawType = typeMatch ? typeMatch[1].toLowerCase() : null;
+  const columnType = (rawType && typeMap[rawType]) ?? 'DECIMAL(18,4)';
+
+  return { fact: matchedFact.name, columnName, columnType };
+}
+
 async applyChatModification(
   database: string,
   currentSchema: any,
@@ -2858,9 +3068,6 @@ async applyChatModification(
 
   const internalCurrentSchema = this.restoreInternalNames(currentSchema, validTableNames);
 
-  // ✅ Question théorique générale (ne mentionne aucune table du schéma, ni référence au contexte)
-  // -> envoyée SANS contexte de schéma, pour éviter que le modèle mélange sa connaissance
-  // générale avec les données spécifiques de ce schéma.
   if (!this.isQuestionAboutCurrentSchema(userMessage, internalCurrentSchema)) {
     const historyBlock = this.formatRecentHistory(recentExchanges);
     const genericPrompt = `Tu es un expert en Business Intelligence et modélisation de data warehouse.
@@ -2891,7 +3098,6 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
     }
   }
 
-  // ✅ question/remarque liée au schéma actuel MAIS sans verbe d'action clair
   const ACTION_VERBS = ['retir', 'supprim', 'enlev', 'ajout', 'ajoute', 'deplac', 'déplac', 'transform', 'cree', 'crée', 'change', 'modifi', 'renomm'];
   const messageHasActionVerb = ACTION_VERBS.some((v) => userMessage.toLowerCase().includes(v));
 
@@ -2930,7 +3136,9 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
     }
   }
 
-  // --- À partir d'ici : un verbe d'action a été détecté, on tente une vraie modification ---
+  const factCreationHint = this.extractFactCreationHint(userMessage, internalCurrentSchema);
+  const addFactColumnHint = this.extractAddFactColumnHint(userMessage, internalCurrentSchema);
+
   const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage, recentExchanges);
 
   let lastError: string | null = null;
@@ -2960,9 +3168,47 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
         }
       }
 
-      // ✅ Filet de sécurité 1 : le modèle confond souvent "créer une dimension avec une colonne"
-      // et "ajouter une colonne à une dimension existante". Si la cible n'existe nulle part
-      // et qu'il n'y a qu'un seul fait, on réinterprète l'action comme une création.
+      if (factCreationHint) {
+        const llmGaveCreateAction = action.action === 'create_fact_table';
+
+        const mergedName = factCreationHint.name
+          ?? (llmGaveCreateAction && action.name ? action.name : null);
+
+        const llmDimensions: string[] = llmGaveCreateAction && Array.isArray(action.dimensions)
+          ? action.dimensions.map((d: string) => this.stripPrefix(d))
+          : [];
+        const mergedDimensions = factCreationHint.dimensions.length > 0
+          ? factCreationHint.dimensions
+          : llmDimensions;
+
+        const llmMeasures = llmGaveCreateAction && Array.isArray(action.measures) ? action.measures : [];
+        const mergedMeasures = factCreationHint.measures.length > 0
+          ? factCreationHint.measures
+          : llmMeasures;
+
+        if (!llmGaveCreateAction) {
+          console.warn(`[applyChatModification] Intention de création de fait détectée par regex mais LLM a choisi "${action.action}" — forcé vers create_fact_table.`);
+        }
+
+        action = {
+          action: 'create_fact_table',
+          name: mergedName,
+          dimensions: mergedDimensions,
+          measures: mergedMeasures,
+          reply: action.reply ?? '',
+        };
+      }
+      else if (addFactColumnHint) {
+        console.warn(`[applyChatModification] Ajout de mesure détecté par regex, action forcée : ${JSON.stringify(addFactColumnHint)}`);
+        action = {
+          action: 'add_fact_column',
+          fact: addFactColumnHint.fact,
+          columnName: addFactColumnHint.columnName,
+          columnType: addFactColumnHint.columnType,
+          reply: action.reply ?? '',
+        };
+      }
+
       if (action.action === 'add_dimension_column') {
         const targetName = action.dimension;
         const existsAsReal = internalCurrentSchema.dimensions?.some((d: string) => this.stripPrefix(d) === this.stripPrefix(targetName));
@@ -2980,16 +3226,45 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
         }
       }
 
-      // ✅ Filet de sécurité 2 : le modèle confond souvent rename_column/change_column_type
-      // (réservées aux dimensions virtuelles) avec une vraie table du staging. On détecte
-      // la nature réelle de la table et on redirige automatiquement vers rename_real_column.
+      if (action.action === 'add_fact_column') {
+        const targetFactName = action.fact;
+        const existsAsVirtualFact = internalCurrentSchema.virtualFacts?.some(
+          (vf: any) => vf.name.toLowerCase() === String(targetFactName).toLowerCase(),
+        );
+        if (!existsAsVirtualFact) {
+          console.warn(`[applyChatModification] Fait "${targetFactName}" introuvable pour add_fact_column, action ignorée.`);
+          return {
+            updatedSchema: currentSchema,
+            explanation: `Impossible d'ajouter la colonne : le fait "${targetFactName}" n'existe pas. Précise le nom exact ou demande d'abord sa création.`,
+            schemaChanged: false,
+          };
+        }
+      }
+
+      // ✅ CORRIGÉ (Correctif 2) : distingue maintenant fait virtuel / dimension virtuelle / table réelle
+      // avant de choisir où rediriger rename_column / change_column_type.
       if (action.action === 'rename_column' || action.action === 'change_column_type') {
         const targetTable = action.table;
-        const isVirtual = internalCurrentSchema.virtualDimensions?.some(
-          (vd: any) => vd.name.toLowerCase() === this.stripPrefix(targetTable).toLowerCase(),
+        const strippedTarget = this.stripPrefix(targetTable).toLowerCase();
+
+        const isVirtualDim = internalCurrentSchema.virtualDimensions?.some(
+          (vd: any) => vd.name.toLowerCase() === strippedTarget,
+        );
+        const isVirtualFact = internalCurrentSchema.virtualFacts?.some(
+          (vf: any) => vf.name.toLowerCase() === strippedTarget,
         );
 
-        if (!isVirtual) {
+        if (isVirtualFact) {
+          console.warn(`[applyChatModification] "${action.action}" redirigé vers "rename_fact_measure" : "${targetTable}" est un fait virtuel.`);
+          action = {
+            action: 'rename_fact_measure',
+            fact: this.stripPrefix(targetTable),
+            oldColumn: action.oldColumn ?? action.column,
+            newColumn: action.newColumn,
+            newType: action.newType,
+            reply: action.reply,
+          };
+        } else if (!isVirtualDim) {
           console.warn(`[applyChatModification] "${action.action}" redirigé vers "rename_real_column" : "${targetTable}" est une table réelle, pas une dimension virtuelle.`);
           action = {
             action: 'rename_real_column',
