@@ -675,21 +675,32 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
     sourceColumn: sd.sourceColumn,
     generatedPrimaryKey: sd.generatedPrimaryKey,
   }));
-const virtualDimensions = (rawSchema.virtualDimensions ?? []).map((vd: any) => {
-  const dimName = stripPrefix(vd.name);
-  // extraColumns ne doit JAMAIS contenir la clé technique {dimName}Id, ajoutée
-  // automatiquement côté DdlGenerator — on l'exclut explicitement par sécurité.
-  const cleanedExtraColumns = (vd.extraColumns ?? []).filter(
-    (c: any) => c.name.toLowerCase() !== `${dimName.toLowerCase()}id`,
-  );
-  return {
-    name: dimName,
-    linkedFact: stripPrefix(vd.linkedFact),
-    extraColumns: cleanedExtraColumns,
-  };
-});
+
+  const virtualDimensions = (rawSchema.virtualDimensions ?? []).map((vd: any) => {
+    const dimName = stripPrefix(vd.name);
+    // extraColumns ne doit JAMAIS contenir la clé technique {dimName}Id, ajoutée
+    // automatiquement côté DdlGenerator — on l'exclut explicitement par sécurité.
+    const cleanedExtraColumns = (vd.extraColumns ?? []).filter(
+      (c: any) => c.name.toLowerCase() !== `${dimName.toLowerCase()}id`,
+    );
+    return {
+      name: dimName,
+      linkedFact: stripPrefix(vd.linkedFact),
+      extraColumns: cleanedExtraColumns,
+    };
+  });
 
   const generatedDimensions = rawSchema.generatedDimensions ?? [];
+
+  // ✅ NOUVEAU : transformations de colonnes réelles (renommage/retypage sur des tables staging),
+  // indispensable pour que tableAttributes ci-dessous reflète le bon nom/type, ET pour que
+  // l'ETL C# sache faire le lien entre l'ancienne colonne staging et la nouvelle colonne DW.
+  const columnTransformations = (rawSchema.columnTransformations ?? []).map((t: any) => ({
+    table: stripPrefix(t.table),
+    originalColumn: t.originalColumn,
+    newColumn: t.newColumn,
+    newColumnType: t.newColumnType,
+  }));
 
   const tableAttributes: Record<string, { name: string; type: string }[]> = {};
 
@@ -709,10 +720,22 @@ const virtualDimensions = (rawSchema.virtualDimensions ?? []).map((vd: any) => {
         ORDER BY ORDINAL_POSITION
       `);
 
-      tableAttributes[tableName] = columnsResult.recordset.map((c) => ({
-        name: c.COLUMN_NAME,
-        type: this.mapSqlTypeForDw(c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE),
-      }));
+      // ✅ NOUVEAU : applique le renommage/retypage éventuel sur chaque colonne réelle
+      const transformsForTable = columnTransformations.filter(
+        (t: any) => t.table.toLowerCase() === tableName.toLowerCase(),
+      );
+
+      tableAttributes[tableName] = columnsResult.recordset.map((c) => {
+        const transform = transformsForTable.find(
+          (t: any) => t.originalColumn.toLowerCase() === c.COLUMN_NAME.toLowerCase(),
+        );
+        return transform
+          ? { name: transform.newColumn, type: transform.newColumnType }
+          : {
+              name: c.COLUMN_NAME,
+              type: this.mapSqlTypeForDw(c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE),
+            };
+      });
     }
 
     for (const sd of subDimensions) {
@@ -738,18 +761,18 @@ const virtualDimensions = (rawSchema.virtualDimensions ?? []).map((vd: any) => {
           ];
     }
 
-   for (const vd of (rawSchema.virtualDimensions ?? [])) {
-  const vdName = stripPrefix(vd.name);
-  const original = rawSchema.tableAttributes?.[vd.name] ?? rawSchema.tableAttributes?.[`staging_${vd.name}`];
-  const pkColumnName = `${vdName}Id`.toLowerCase();
+    for (const vd of (rawSchema.virtualDimensions ?? [])) {
+      const vdName = stripPrefix(vd.name);
+      const original = rawSchema.tableAttributes?.[vd.name] ?? rawSchema.tableAttributes?.[`staging_${vd.name}`];
+      const pkColumnName = `${vdName}Id`.toLowerCase();
 
-  if (original && original.length > 0) {
-    // Ne garde que les colonnes autres que la PK technique, celle-ci sera régénérée par .NET
-    tableAttributes[vdName] = original.filter((c: any) => c.name.toLowerCase() !== pkColumnName);
-  } else {
-    tableAttributes[vdName] = (vd.extraColumns ?? []).filter((c: any) => c.name.toLowerCase() !== pkColumnName);
-  }
-}
+      if (original && original.length > 0) {
+        // Ne garde que les colonnes autres que la PK technique, celle-ci sera régénérée par .NET
+        tableAttributes[vdName] = original.filter((c: any) => c.name.toLowerCase() !== pkColumnName);
+      } else {
+        tableAttributes[vdName] = (vd.extraColumns ?? []).filter((c: any) => c.name.toLowerCase() !== pkColumnName);
+      }
+    }
   } finally {
     await pool.close();
   }
@@ -764,8 +787,9 @@ const virtualDimensions = (rawSchema.virtualDimensions ?? []).map((vd: any) => {
     factColumnTransformations,
     subDimensions,
     tableAttributes,
-    virtualFacts, // <-- champ manquant, maintenant transmis
+    virtualFacts,
     virtualDimensions,
+    columnTransformations, // ✅ AJOUTÉ — transmis à l'API .NET pour l'ETL
   };
 }
 

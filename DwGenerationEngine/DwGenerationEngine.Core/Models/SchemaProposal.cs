@@ -12,7 +12,9 @@ public class SchemaProposal
     public List<GeneratedDimension> GeneratedDimensions { get; set; } = new();
     public List<FactColumnTransformation> FactColumnTransformations { get; set; } = new();
     public List<VirtualFact> VirtualFacts { get; set; } = new();
-        public List<VirtualDimension> VirtualDimensions { get; set; } = new();
+    public List<VirtualDimension> VirtualDimensions { get; set; } = new();
+
+    public List<RealColumnTransformation> ColumnTransformations { get; init; } = new();
 
 }
 
@@ -73,3 +75,5 @@ public class VirtualDimension
     public required string LinkedFact { get; set; }
     public List<TableAttribute> ExtraColumns { get; set; } = new();
 }
+
+public record RealColumnTransformation(string Table, string OriginalColumn, string NewColumn, string NewColumnType);

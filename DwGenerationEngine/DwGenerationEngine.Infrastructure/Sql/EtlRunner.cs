@@ -57,8 +57,7 @@ public class EtlRunner : IEtlRunner
 
                 var attributes = schema.TableAttributes.GetValueOrDefault(dimName, new List<TableAttribute>());
                 var subDimsForThisTable = schema.SubDimensions.Where(sd => sd.ParentDimension == dimName).ToList();
-                var tableResult = await LoadSimpleDimensionAsync(connection, transaction, schema.StagingDatabase, dimName, attributes, subDimsForThisTable);
-                result.Tables.Add(tableResult);
+                var tableResult = await LoadSimpleDimensionAsync(connection, transaction, schema.StagingDatabase, dimName, attributes, subDimsForThisTable, schema.ColumnTransformations);                result.Tables.Add(tableResult);
             }
 
             // 4. Faits : lookup des clés naturelles -> clés de substitution
@@ -83,7 +82,7 @@ public class EtlRunner : IEtlRunner
     var factLinks = allFactLinks.Where(l => l.FactTable == factName).ToList();
 
     var tableResult = await LoadFactTableAsync(
-        connection, transaction, schema.StagingDatabase, factName, attributes, transformations, factLinks);
+    connection, transaction, schema.StagingDatabase, factName, attributes, transformations, factLinks, schema.ColumnTransformations);
     result.Tables.Add(tableResult);
 }
 
@@ -180,122 +179,143 @@ public class EtlRunner : IEtlRunner
     // ---------- Dimensions simples (avec lookup vers leurs sous-dimensions) ----------
 
     private static async Task<EtlTableResult> LoadSimpleDimensionAsync(
-        SqlConnection connection, SqlTransaction transaction, string stagingDb, string tableName,
-        List<TableAttribute> attributes, List<SubDimension> subDims)
+    SqlConnection connection, SqlTransaction transaction, string stagingDb, string tableName,
+    List<TableAttribute> attributes, List<SubDimension> subDims,
+    List<RealColumnTransformation> columnTransformations) // ✅ NOUVEAU
+{
+    var stagingTable = StagingTableName(tableName);
+    var subDimSourceColumns = subDims.Select(sd => sd.SourceColumn).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    var transformsByNewName = columnTransformations
+        .Where(t => t.Table == tableName)
+        .ToDictionary(t => t.NewColumn, t => t.OriginalColumn, StringComparer.OrdinalIgnoreCase);
+
+    var normalAttributes = attributes
+        .Where(a => !subDimSourceColumns.Contains(a.Name))
+        .ToList();
+
+    // Colonne DW = a.Name (déjà renommée si transformée) ; colonne source staging = mapping si transformée, sinon identique
+    var normalInsertColumns = normalAttributes.Select(a => a.Name).ToList();
+    var normalSelectExpressions = normalAttributes
+        .Select(a => transformsByNewName.TryGetValue(a.Name, out var originalCol)
+            ? $"s.[{originalCol}]"
+            : $"s.[{a.Name}]")
+        .ToList();
+
+    var joins = new List<string>();
+    var subDimSelectColumns = new List<string>();
+    var subDimInsertColumns = new List<string>();
+    int aliasIndex = 0;
+
+    foreach (var sd in subDims)
     {
-        var stagingTable = StagingTableName(tableName);
-        var subDimSourceColumns = subDims.Select(sd => sd.SourceColumn).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var normalColumns = attributes
-            .Where(a => !subDimSourceColumns.Contains(a.Name))
-            .Select(a => a.Name)
-            .ToList();
-
-        var joins = new List<string>();
-        var subDimSelectColumns = new List<string>();
-        var subDimInsertColumns = new List<string>();
-        int aliasIndex = 0;
-
-        foreach (var sd in subDims)
-        {
-            var alias = $"sd{aliasIndex++}";
-            joins.Add($"LEFT JOIN [dbo].[{sd.Name}] {alias} ON s.[{sd.SourceColumn}] = {alias}.[{sd.SourceColumn}]");
-            subDimSelectColumns.Add($"{alias}.[{sd.GeneratedPrimaryKey}]");
-            subDimInsertColumns.Add(sd.GeneratedPrimaryKey);
-        }
-
-        var insertColumns = normalColumns.Concat(subDimInsertColumns);
-        var selectColumns = normalColumns.Select(c => $"s.[{c}]").Concat(subDimSelectColumns);
-
-        var sql = $@"
-            INSERT INTO [dbo].[{tableName}] ({string.Join(", ", insertColumns.Select(c => $"[{c}]"))})
-            SELECT {string.Join(", ", selectColumns)}
-            FROM [{stagingDb}].[dbo].[{stagingTable}] s
-            {string.Join("\n", joins)};";
-
-        var rows = await ExecuteNonQueryAsync(connection, transaction, sql);
-        return new EtlTableResult { TableName = tableName, RowsInserted = rows };
+        var alias = $"sd{aliasIndex++}";
+        joins.Add($"LEFT JOIN [dbo].[{sd.Name}] {alias} ON s.[{sd.SourceColumn}] = {alias}.[{sd.SourceColumn}]");
+        subDimSelectColumns.Add($"{alias}.[{sd.GeneratedPrimaryKey}]");
+        subDimInsertColumns.Add(sd.GeneratedPrimaryKey);
     }
 
+    var insertColumns = normalInsertColumns.Concat(subDimInsertColumns);
+    var selectColumns = normalSelectExpressions.Concat(subDimSelectColumns);
+
+    var sql = $@"
+        INSERT INTO [dbo].[{tableName}] ({string.Join(", ", insertColumns.Select(c => $"[{c}]"))})
+        SELECT {string.Join(", ", selectColumns)}
+        FROM [{stagingDb}].[dbo].[{stagingTable}] s
+        {string.Join("\n", joins)};";
+
+    var rows = await ExecuteNonQueryAsync(connection, transaction, sql);
+    return new EtlTableResult { TableName = tableName, RowsInserted = rows };
+}
     // ---------- Faits ----------
 
     private static async Task<EtlTableResult> LoadFactTableAsync(
-        SqlConnection connection,
-        SqlTransaction transaction,
-        string stagingDb,
-        string factName,
-        List<TableAttribute> attributes,
-        List<FactColumnTransformation> transformations,
-        List<FactDimensionLink> factLinks)
+    SqlConnection connection,
+    SqlTransaction transaction,
+    string stagingDb,
+    string factName,
+    List<TableAttribute> attributes,
+    List<FactColumnTransformation> transformations,
+    List<FactDimensionLink> factLinks,
+    List<RealColumnTransformation> columnTransformations) // ✅ NOUVEAU
+{
+    var warnings = new List<string>();
+    var stagingTable = StagingTableName(factName);
+
+    var excludedColumns = transformations.Select(t => t.OriginalColumn)
+        .Concat(factLinks.Select(l => l.NaturalKeyColumn))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    var transformsByNewName = columnTransformations
+        .Where(t => t.Table == factName)
+        .ToDictionary(t => t.NewColumn, t => t.OriginalColumn, StringComparer.OrdinalIgnoreCase);
+
+    var normalAttributes = attributes
+        .Where(a => !excludedColumns.Contains(a.Name))
+        .ToList();
+
+    var normalInsertColumns = normalAttributes.Select(a => a.Name).ToList();
+    var normalSelectExpressions = normalAttributes
+        .Select(a => transformsByNewName.TryGetValue(a.Name, out var originalCol)
+            ? $"s.[{originalCol}]"
+            : $"s.[{a.Name}]")
+        .ToList();
+
+    var timeJoins = new List<string>();
+    var timeSelectColumns = new List<string>();
+    var timeInsertColumns = new List<string>();
+    int timeAliasIndex = 0;
+
+    foreach (var t in transformations)
     {
-        var warnings = new List<string>();
-        var stagingTable = StagingTableName(factName);
-
-        var excludedColumns = transformations.Select(t => t.OriginalColumn)
-            .Concat(factLinks.Select(l => l.NaturalKeyColumn))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var normalColumns = attributes
-            .Where(a => !excludedColumns.Contains(a.Name))
-            .Select(a => a.Name)
-            .ToList();
-
-        var timeJoins = new List<string>();
-        var timeSelectColumns = new List<string>();
-        var timeInsertColumns = new List<string>();
-        int timeAliasIndex = 0;
-
-        foreach (var t in transformations)
-        {
-            var alias = $"td{timeAliasIndex++}";
-            timeJoins.Add(
-                $"LEFT JOIN [dbo].[{t.ReferencesTable}] {alias} ON CONVERT(INT, FORMAT(s.[{t.OriginalColumn}], 'yyyyMMdd')) = {alias}.[{t.ReferencesColumn}]");
-            timeSelectColumns.Add($"{alias}.[{t.ReferencesColumn}]");
-            timeInsertColumns.Add(t.NewColumn);
-        }
-
-        var dimJoins = new List<string>();
-        var dimSelectColumns = new List<string>();
-        var dimInsertColumns = new List<string>();
-        int dimAliasIndex = 0;
-
-        foreach (var l in factLinks)
-        {
-            var alias = $"dd{dimAliasIndex++}";
-            dimJoins.Add(
-                $"LEFT JOIN [dbo].[{l.DimensionTable}] {alias} ON s.[{l.NaturalKeyColumn}] = {alias}.[{l.DimensionNaturalKeyColumn}]");
-            dimSelectColumns.Add($"{alias}.[{l.DimensionSurrogateKeyColumn}]");
-            dimInsertColumns.Add(l.NewFactColumnName);
-        }
-
-        var insertColumns = normalColumns.Concat(timeInsertColumns).Concat(dimInsertColumns);
-        var selectColumns = normalColumns.Select(c => $"s.[{c}]")
-            .Concat(timeSelectColumns)
-            .Concat(dimSelectColumns);
-        var allJoins = timeJoins.Concat(dimJoins);
-
-        var sql = $@"
-            INSERT INTO [dbo].[{factName}] ({string.Join(", ", insertColumns.Select(c => $"[{c}]"))})
-            SELECT {string.Join(", ", selectColumns)}
-            FROM [{stagingDb}].[dbo].[{stagingTable}] s
-            {string.Join("\n", allJoins)};";
-
-        var rows = await ExecuteNonQueryAsync(connection, transaction, sql);
-
-        foreach (var l in factLinks)
-        {
-            var checkSql = $@"
-                SELECT COUNT(*) FROM [dbo].[{factName}] f
-                WHERE f.[{l.NewFactColumnName}] IS NULL;";
-            var orphanCount = await ExecuteScalarAsync(connection, transaction, checkSql);
-            if (orphanCount > 0)
-            {
-                warnings.Add($"{orphanCount} ligne(s) sans correspondance pour {l.NewFactColumnName} (FK laissée à NULL).");
-            }
-        }
-
-        return new EtlTableResult { TableName = factName, RowsInserted = rows, Warnings = warnings };
+        var alias = $"td{timeAliasIndex++}";
+        timeJoins.Add(
+            $"LEFT JOIN [dbo].[{t.ReferencesTable}] {alias} ON CONVERT(INT, FORMAT(s.[{t.OriginalColumn}], 'yyyyMMdd')) = {alias}.[{t.ReferencesColumn}]");
+        timeSelectColumns.Add($"{alias}.[{t.ReferencesColumn}]");
+        timeInsertColumns.Add(t.NewColumn);
     }
+
+    var dimJoins = new List<string>();
+    var dimSelectColumns = new List<string>();
+    var dimInsertColumns = new List<string>();
+    int dimAliasIndex = 0;
+
+    foreach (var l in factLinks)
+    {
+        var alias = $"dd{dimAliasIndex++}";
+        dimJoins.Add(
+            $"LEFT JOIN [dbo].[{l.DimensionTable}] {alias} ON s.[{l.NaturalKeyColumn}] = {alias}.[{l.DimensionNaturalKeyColumn}]");
+        dimSelectColumns.Add($"{alias}.[{l.DimensionSurrogateKeyColumn}]");
+        dimInsertColumns.Add(l.NewFactColumnName);
+    }
+
+    var insertColumns = normalInsertColumns.Concat(timeInsertColumns).Concat(dimInsertColumns);
+    var selectColumns = normalSelectExpressions
+        .Concat(timeSelectColumns)
+        .Concat(dimSelectColumns);
+    var allJoins = timeJoins.Concat(dimJoins);
+
+    var sql = $@"
+        INSERT INTO [dbo].[{factName}] ({string.Join(", ", insertColumns.Select(c => $"[{c}]"))})
+        SELECT {string.Join(", ", selectColumns)}
+        FROM [{stagingDb}].[dbo].[{stagingTable}] s
+        {string.Join("\n", allJoins)};";
+
+    var rows = await ExecuteNonQueryAsync(connection, transaction, sql);
+
+    foreach (var l in factLinks)
+    {
+        var checkSql = $@"
+            SELECT COUNT(*) FROM [dbo].[{factName}] f
+            WHERE f.[{l.NewFactColumnName}] IS NULL;";
+        var orphanCount = await ExecuteScalarAsync(connection, transaction, checkSql);
+        if (orphanCount > 0)
+        {
+            warnings.Add($"{orphanCount} ligne(s) sans correspondance pour {l.NewFactColumnName} (FK laissée à NULL).");
+        }
+    }
+    return new EtlTableResult { TableName = factName, RowsInserted = rows, Warnings = warnings };
+}
 
     // ---------- Utilitaires ----------
 

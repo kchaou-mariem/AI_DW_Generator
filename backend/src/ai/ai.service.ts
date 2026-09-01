@@ -16,8 +16,14 @@ export interface AiSchemaProposal {
   rawResponse: string;
   warnings: string[];
   excludedColumns: Record<string, string[]>; // { "Employees": ["FirstName"] }
+  columnTransformations: ColumnTransformation[];
 }
-
+export interface ColumnTransformation {
+  table: string;
+  originalColumn: string;
+  newColumn: string;
+  newColumnType: string;
+}
 export interface SubDimension {
   name: string;
   parentDimension: string;
@@ -210,6 +216,7 @@ private buildTableAttributes(
   virtualFacts: VirtualFact[] = [],
   virtualDimensions: VirtualDimension[] = [],
   excludedColumns: Record<string, string[]> = {},
+  columnTransformations: ColumnTransformation[] = [], // ✅ NOUVEAU paramètre
 ): Record<string, { name: string; type: string }[]> {
   const attributes: Record<string, { name: string; type: string }[]> = {};
 
@@ -219,15 +226,24 @@ private buildTableAttributes(
     (t) => !virtualFactNames.has(t) && !virtualDimNames.has(t),
   );
 
-for (const tableName of allRealTables) {
-  const tableMeta = metadata.find((m) => m[0]?.sourceTable === tableName);
-  if (tableMeta) {
-    const excluded = new Set((excludedColumns?.[tableName] ?? []).map((c: string) => c.toLowerCase()));
-    attributes[tableName] = tableMeta
-      .filter((col) => !excluded.has(col.columnName.toLowerCase()))
-      .map((col) => ({ name: col.columnName, type: col.dataType }));
+  for (const tableName of allRealTables) {
+    const tableMeta = metadata.find((m) => m[0]?.sourceTable === tableName);
+    if (tableMeta) {
+      const excluded = new Set((excludedColumns?.[tableName] ?? []).map((c: string) => c.toLowerCase()));
+      const transformsForTable = columnTransformations.filter(
+        (t) => this.stripPrefix(t.table).toLowerCase() === this.stripPrefix(tableName).toLowerCase(),
+      );
+
+      attributes[tableName] = tableMeta
+        .filter((col) => !excluded.has(col.columnName.toLowerCase()))
+        .map((col) => {
+          const transform = transformsForTable.find((t) => t.originalColumn.toLowerCase() === col.columnName.toLowerCase());
+          return transform
+            ? { name: transform.newColumn, type: transform.newColumnType }
+            : { name: col.columnName, type: col.dataType };
+        });
+    }
   }
-}
 
   for (const gen of generatedDimensions) {
     attributes[gen.name] = gen.columns.map((c: any) => ({ name: c.name, type: c.type }));
@@ -1823,8 +1839,27 @@ let confirmedRelations = [...parsed.confirmedRelations, ...autoVirtualFactRelati
   }
 
   // --- 10. Construction des attributs des tables ---
+// const virtualFacts: VirtualFact[] = [...((parsed as any).virtualFacts ?? []), ...autoVirtualFacts];
+// const virtualDimensions: VirtualDimension[] = (parsed as any).virtualDimensions ?? [];
+
+// const columnTransformations: ColumnTransformation[] = (parsed as any).columnTransformations ?? [];
+
+// const tableAttributes = this.buildTableAttributes(
+//   cleanDimensions,
+//   cleanFacts,
+//   metadata,
+//   generatedDimensions,
+//   subDimensions,
+//   virtualFacts,
+//   virtualDimensions,
+//   undefined, // excludedColumns déjà géré séparément plus bas, garde ta valeur existante ici
+//   columnTransformations,
+// );
+// const excludedColumns = (parsed as any).excludedColumns ?? {};
 const virtualFacts: VirtualFact[] = [...((parsed as any).virtualFacts ?? []), ...autoVirtualFacts];
 const virtualDimensions: VirtualDimension[] = (parsed as any).virtualDimensions ?? [];
+const columnTransformations: ColumnTransformation[] = (parsed as any).columnTransformations ?? [];
+const excludedColumns = (parsed as any).excludedColumns ?? {}; // ✅ calculé AVANT
 
 const tableAttributes = this.buildTableAttributes(
   cleanDimensions,
@@ -1834,8 +1869,9 @@ const tableAttributes = this.buildTableAttributes(
   subDimensions,
   virtualFacts,
   virtualDimensions,
+  excludedColumns, // ✅ la vraie valeur, plus undefined
+  columnTransformations,
 );
-const excludedColumns = (parsed as any).excludedColumns ?? {};
   // --- 11. Retourner le résultat ---
 return {
   dimensions: cleanDimensions,
@@ -1849,6 +1885,7 @@ return {
   virtualFacts,
   virtualDimensions,
   excludedColumns,
+  columnTransformations,
   warnings,
 };
 }
@@ -2418,6 +2455,58 @@ case 'change_column_type': {
     changed: true,
   };
 }
+case 'rename_real_column': {
+  const tableName = action.table;
+  const oldColumn = action.oldColumn;
+  const newColumn = (action.newColumn && typeof action.newColumn === 'string' && action.newColumn.trim())
+    ? action.newColumn.trim()
+    : null;
+  const newType = (action.newType && typeof action.newType === 'string' && action.newType.trim())
+    ? action.newType.trim()
+    : null;
+
+  if (!newColumn && !newType) {
+    return { newSchema: schema, deterministicExplanation: `Ni nouveau nom ni nouveau type fourni, aucun changement.`, changed: false };
+  }
+  if (typeof oldColumn !== 'string' || !oldColumn) {
+    return { newSchema: schema, deterministicExplanation: `Colonne d'origine mal spécifiée, aucun changement.`, changed: false };
+  }
+
+  const realDimExists = (schema.dimensions ?? []).some((d: string) => this.stripPrefix(d).toLowerCase() === this.stripPrefix(tableName).toLowerCase());
+  const realFactExists = (schema.facts ?? []).some((f: string) => this.stripPrefix(f).toLowerCase() === this.stripPrefix(tableName).toLowerCase());
+  if (!realDimExists && !realFactExists) {
+    return { newSchema: schema, deterministicExplanation: `Table "${tableName}" introuvable, aucun changement.`, changed: false };
+  }
+
+  const strippedTable = this.stripPrefix(tableName);
+  const existingAttrs = (schema.tableAttributes ?? {})[strippedTable] ?? [];
+  const originalAttr = existingAttrs.find((a: any) => a.name.toLowerCase() === oldColumn.toLowerCase());
+  if (!originalAttr) {
+    return { newSchema: schema, deterministicExplanation: `Colonne "${oldColumn}" introuvable dans "${tableName}", aucun changement.`, changed: false };
+  }
+
+  const finalNewColumn = newColumn ?? oldColumn;
+  const finalNewType = newType ?? originalAttr.type;
+
+  // Une seule transformation active par (table, colonne source) : on remplace si elle existe déjà
+  schema.columnTransformations = (schema.columnTransformations ?? []).filter(
+    (t: any) => !(this.stripPrefix(t.table).toLowerCase() === strippedTable.toLowerCase() && t.originalColumn.toLowerCase() === oldColumn.toLowerCase()),
+  );
+  schema.columnTransformations = [
+    ...schema.columnTransformations,
+    { table: strippedTable, originalColumn: oldColumn, newColumn: finalNewColumn, newColumnType: finalNewType },
+  ];
+
+  const parts: string[] = [];
+  if (newColumn) parts.push(`renommée en "${finalNewColumn}"`);
+  if (newType) parts.push(`type changé en "${finalNewType}"`);
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Colonne "${oldColumn}" de "${tableName}" ${parts.join(' et ')}.`,
+    changed: true,
+  };
+}
     default:
       return { newSchema: schema, deterministicExplanation: '', changed: false };
   }
@@ -2461,7 +2550,6 @@ case 'change_column_type': {
 
 // ⚠️ Reply ONLY with valid JSON for ONE action, nothing else.`;
 // }
-
 private buildChatPrompt(currentSchema: any, userMessage: string, recentExchanges: { user: string; ai: string }[] = []): string {
   const historyBlock = this.formatRecentHistory(recentExchanges);
   const dims = (currentSchema.dimensions ?? []).join(', ');
@@ -2480,12 +2568,23 @@ private buildChatPrompt(currentSchema: any, userMessage: string, recentExchanges
     })
     .join(' | ');
 
+  // ✅ Colonnes exactes des tables réelles (staging), nécessaire pour "rename_real_column"
+  const virtualNames = new Set([
+    ...(currentSchema.virtualDimensions ?? []).map((vd: any) => vd.name),
+    ...(currentSchema.virtualFacts ?? []).map((vf: any) => vf.name),
+  ]);
+  const realTableColumns = Object.entries(currentSchema.tableAttributes ?? {})
+    .filter(([tableName]) => !virtualNames.has(tableName) && !tableName.toLowerCase().includes('dimtemps'))
+    .map(([tableName, cols]: [string, any]) => `${tableName}: ${(cols as any[]).map((c) => `${c.name} (${c.type})`).join(', ')}`)
+    .join(' | ');
+
   return `You manage a data warehouse schema. Current state:
 Dimensions: ${dims || 'none'}
 Facts: ${facts || 'none'}
 Relations: ${relations || 'none'}
 Sub-dimensions: ${subDims || 'none'}
 Virtual dimension columns (EXACT names, use these ONLY): ${virtualDimColumns || 'none'}
+Real table columns from staging (EXACT names, use these ONLY): ${realTableColumns || 'none'}
 ${historyBlock}
 User message: "${userMessage}"
 
@@ -2512,20 +2611,28 @@ Available actions for ACTUAL modifications:
 - {"action":"remove_subdimension","name":"DimX","reply":"..."}
 - {"action":"create_fact_table","name":"FactName","dimensions":["Dim1","Dim2"],"reply":"..."} — create a NEW empty fact table with foreign keys to the listed dimensions (dimensions must be EXACT names from the list above, at least 2)
 - {"action":"create_dimension","name":"DimName","linkedFact":"FactName","columns":[{"name":"colName","type":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)"}],"reply":"..."} — create a NEW empty dimension table linked to an EXISTING fact table. "columns" is OPTIONAL: only include extra columns explicitly requested by the user (besides the automatic primary key). Map data types mentioned in French to SQL types (e.g. "salaire"/"montant" -> DECIMAL(18,4), "nombre"/"entier" -> INT, "texte"/"nom" -> VARCHAR(255), "date" -> DATE).
-- {"action":"remove_dimension_column","dimension":"DimName","column":"colName","reply":"..."} — remove an extra column from a virtual dimension (never removes the automatic primary key)
+- {"action":"remove_dimension_column","dimension":"DimName","column":"colName","reply":"..."} — remove an extra column from a VIRTUAL dimension only (never removes the automatic primary key)
 - {"action":"add_dimension_column","dimension":"DimName","columnName":"colName","columnType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — add a new column to an EXISTING virtual dimension.
-- {"action":"rename_table","oldName":"OldName","newName":"NewName","reply":"..."} — rename an EXISTING dimension or fact table (virtual or real). "oldName" must be an EXACT name from the lists above.
-- {"action":"rename_column","table":"DimName","oldColumn":"oldColName","newColumn":"newColName","reply":"..."} — rename a column in an EXISTING virtual dimension (created via create_dimension/add_dimension_column). Never use this for a real staging table's column — refuse with "answer_question" instead and explain it's not supported.
-- {"action":"change_column_type","table":"DimName","column":"colName","newType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — change the SQL type of an EXISTING column in a virtual dimension. "column" MUST be an EXACT name from "Virtual dimension columns" above (never the automatic primary key). Never use this for a real staging table's column — refuse with "answer_question" instead.
+- {"action":"rename_table","oldName":"OldName","newName":"NewName","reply":"..."} — rename an EXISTING dimension or fact table (virtual or real).
+- {"action":"rename_column","table":"DimName","oldColumn":"oldColName","newColumn":"newColName","reply":"..."} — rename a column ONLY in a VIRTUAL dimension (from "Virtual dimension columns" list).
+- {"action":"change_column_type","table":"DimName","column":"colName","newType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — change the type of a column ONLY in a VIRTUAL dimension (from "Virtual dimension columns" list).
+- {"action":"rename_real_column","table":"TableName","oldColumn":"oldColName","newColumn":"newColName","newType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — rename AND/OR retype a column from a REAL staging table (from "Real table columns" list). "table" and "oldColumn" MUST match that list exactly. "newColumn" and "newType" are each OPTIONAL (provide at least one): omit "newColumn" to keep the name and only change the type, omit "newType" to keep the type and only rename.
+
+⚠️ CRITICAL ROUTING RULE:
+- If the target table appears in "Virtual dimension columns" -> use "rename_column" or "change_column_type".
+- If the target table appears in "Real table columns" -> use "rename_real_column" (works for rename, retype, or both at once).
+- Never use "rename_column"/"change_column_type" for a table listed only in "Real table columns".
 
 Rules:
 - "table"/"name" must be an EXACT name from the lists above. If it does not match exactly, use "answer_question" instead and explain the name was not found.
-- For "rename_column", "remove_dimension_column", "add_dimension_column", "change_column_type": "oldColumn"/"column" MUST be an EXACT name from "Virtual dimension columns" above. If you cannot find the exact column name there, use "answer_question" instead and explain which column names actually exist.
+- "oldColumn"/"column" MUST be an EXACT name from the matching columns list above (Virtual dimension columns OR Real table columns, depending on the action). If you cannot find it there, use "answer_question" instead and list the real column names that exist.
 - Never touch "DimTemps" or its relations.
 - "reply" is a short, natural sentence in French.
 
 ⚠️ Reply ONLY with valid JSON for ONE action, nothing else.`;
 }
+
+
   private computeDiffExplanation(oldSchema: any, newSchema: any): string {
   const changes: string[] = [];
 
@@ -2784,11 +2891,9 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
     }
   }
 
-  // ✅ NOUVEAU : question/remarque liée au schéma actuel MAIS sans verbe d'action clair
-  // (ex: "et dimstoreregion aussi ?", "pourquoi pas ?", "attention X n'est pas lié à Y")
-  // -> traitée comme une clarification informative, avec contexte + historique,
-  // mais SANS jamais déclencher d'action de modification.
-const ACTION_VERBS = ['retir', 'supprim', 'enlev', 'ajout', 'ajoute', 'deplac', 'déplac', 'transform', 'cree', 'crée', 'change', 'modifi', 'renomm'];  const messageHasActionVerb = ACTION_VERBS.some((v) => userMessage.toLowerCase().includes(v));
+  // ✅ question/remarque liée au schéma actuel MAIS sans verbe d'action clair
+  const ACTION_VERBS = ['retir', 'supprim', 'enlev', 'ajout', 'ajoute', 'deplac', 'déplac', 'transform', 'cree', 'crée', 'change', 'modifi', 'renomm'];
+  const messageHasActionVerb = ACTION_VERBS.some((v) => userMessage.toLowerCase().includes(v));
 
   if (!messageHasActionVerb) {
     const historyBlock = this.formatRecentHistory(recentExchanges);
@@ -2832,48 +2937,70 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
     try {
       const rawResponse = await this.callOllama(prompt);
-let cleaned = rawResponse.replace(/```json|```/g, '').trim();
-const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-cleaned = jsonMatch ? jsonMatch[0] : cleaned;
+      console.log('[DEBUG action brute]', rawResponse);
 
-let action: any;
-try {
-  action = JSON.parse(cleaned);
-} catch (parseErr) {
-  // Réparations basiques courantes chez les petits modèles : virgule manquante entre
-  // deux propriétés, virgule finale avant une accolade/crochet fermante.
-  const repaired = cleaned
-    .replace(/"\s*\n?\s*"/g, '", "')           // guillemet suivi directement d'un guillemet -> virgule manquante
-    .replace(/,\s*([}\]])/g, '$1')              // virgule juste avant } ou ] -> supprimée
-    .replace(/}\s*{/g, '}, {');                 // deux objets collés -> virgule entre eux
+      let cleaned = rawResponse.replace(/```json|```/g, '').trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      cleaned = jsonMatch ? jsonMatch[0] : cleaned;
 
-  try {
-    action = JSON.parse(repaired);
-  } catch (secondErr) {
-    console.warn(`[applyChatModification] JSON action illisible même après réparation: ${cleaned.substring(0, 300)}`);
-    throw parseErr; // relance l'erreur d'origine, la boucle MAX_RETRIES retentera
-  }
-}
+      let action: any;
+      try {
+        action = JSON.parse(cleaned);
+      } catch (parseErr) {
+        const repaired = cleaned
+          .replace(/"\s*\n?\s*"/g, '", "')
+          .replace(/,\s*([}\]])/g, '$1')
+          .replace(/}\s*{/g, '}, {');
 
-// ✅ Filet de sécurité : le modèle confond souvent "créer une dimension avec une colonne"
-// et "ajouter une colonne à une dimension existante". Si la cible n'existe nulle part
-// et qu'il n'y a qu'un seul fait, on réinterprète l'action comme une création.
-if (action.action === 'add_dimension_column') {
-  const targetName = action.dimension;
-  const existsAsReal = internalCurrentSchema.dimensions?.some((d: string) => this.stripPrefix(d) === this.stripPrefix(targetName));
-  const existsAsVirtual = internalCurrentSchema.virtualDimensions?.some((vd: any) => vd.name === targetName);
+        try {
+          action = JSON.parse(repaired);
+        } catch (secondErr) {
+          console.warn(`[applyChatModification] JSON action illisible même après réparation: ${cleaned.substring(0, 300)}`);
+          throw parseErr;
+        }
+      }
 
-  if (!existsAsReal && !existsAsVirtual && (internalCurrentSchema.facts ?? []).length >= 1) {
-    console.warn(`[applyChatModification] "${targetName}" inconnue — reclassé de add_dimension_column vers create_dimension.`);
-    action = {
-      action: 'create_dimension',
-      name: targetName,
-      linkedFact: this.stripPrefix(internalCurrentSchema.facts[0]),
-      columns: [{ name: action.columnName, type: action.columnType }],
-      reply: action.reply,
-    };
-  }
-}
+      // ✅ Filet de sécurité 1 : le modèle confond souvent "créer une dimension avec une colonne"
+      // et "ajouter une colonne à une dimension existante". Si la cible n'existe nulle part
+      // et qu'il n'y a qu'un seul fait, on réinterprète l'action comme une création.
+      if (action.action === 'add_dimension_column') {
+        const targetName = action.dimension;
+        const existsAsReal = internalCurrentSchema.dimensions?.some((d: string) => this.stripPrefix(d) === this.stripPrefix(targetName));
+        const existsAsVirtual = internalCurrentSchema.virtualDimensions?.some((vd: any) => vd.name === targetName);
+
+        if (!existsAsReal && !existsAsVirtual && (internalCurrentSchema.facts ?? []).length >= 1) {
+          console.warn(`[applyChatModification] "${targetName}" inconnue — reclassé de add_dimension_column vers create_dimension.`);
+          action = {
+            action: 'create_dimension',
+            name: targetName,
+            linkedFact: this.stripPrefix(internalCurrentSchema.facts[0]),
+            columns: [{ name: action.columnName, type: action.columnType }],
+            reply: action.reply,
+          };
+        }
+      }
+
+      // ✅ Filet de sécurité 2 : le modèle confond souvent rename_column/change_column_type
+      // (réservées aux dimensions virtuelles) avec une vraie table du staging. On détecte
+      // la nature réelle de la table et on redirige automatiquement vers rename_real_column.
+      if (action.action === 'rename_column' || action.action === 'change_column_type') {
+        const targetTable = action.table;
+        const isVirtual = internalCurrentSchema.virtualDimensions?.some(
+          (vd: any) => vd.name.toLowerCase() === this.stripPrefix(targetTable).toLowerCase(),
+        );
+
+        if (!isVirtual) {
+          console.warn(`[applyChatModification] "${action.action}" redirigé vers "rename_real_column" : "${targetTable}" est une table réelle, pas une dimension virtuelle.`);
+          action = {
+            action: 'rename_real_column',
+            table: this.stripPrefix(targetTable),
+            oldColumn: action.oldColumn ?? action.column,
+            newColumn: action.newColumn,
+            newType: action.newType,
+            reply: action.reply,
+          };
+        }
+      }
 
       const REMOVAL_KEYWORDS = ['retir', 'supprim', 'enlev', 'remov', 'delete', 'drop'];
       const isRemovalAction = action.action?.startsWith('remove_');
@@ -2896,7 +3023,7 @@ if (action.action === 'add_dimension_column') {
         };
       }
 
-const { newSchema, deterministicExplanation, changed } = this.applyChatAction(internalCurrentSchema, action, userMessage);
+      const { newSchema, deterministicExplanation, changed } = this.applyChatAction(internalCurrentSchema, action, userMessage);
 
       if (!changed) {
         return {
@@ -2906,23 +3033,23 @@ const { newSchema, deterministicExplanation, changed } = this.applyChatAction(in
         };
       }
 
-      
- const validated = this.validateAndClean(
-  {
-    dimensions: newSchema.dimensions,
-    facts: newSchema.facts,
-    confirmedRelations: newSchema.confirmedRelations,
-    additionalRelations: [],
-    subDimensions: newSchema.subDimensions ?? [],
-    virtualFacts: newSchema.virtualFacts ?? [],
-    virtualDimensions: newSchema.virtualDimensions ?? [],
-    excludedColumns: newSchema.excludedColumns ?? {}
-  } as any,
-  validTableNames,
-  validColumnsByTable,
-  metadata,
-  false,
-);
+      const validated = this.validateAndClean(
+        {
+          dimensions: newSchema.dimensions,
+          facts: newSchema.facts,
+          confirmedRelations: newSchema.confirmedRelations,
+          additionalRelations: [],
+          subDimensions: newSchema.subDimensions ?? [],
+          virtualFacts: newSchema.virtualFacts ?? [],
+          virtualDimensions: newSchema.virtualDimensions ?? [],
+          excludedColumns: newSchema.excludedColumns ?? {},
+          columnTransformations: newSchema.columnTransformations ?? [],
+        } as any,
+        validTableNames,
+        validColumnsByTable,
+        metadata,
+        false,
+      );
 
       const displayed = this.applyDisplayNames(validated);
 
