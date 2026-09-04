@@ -15,6 +15,7 @@ public class SchemaProposal
     public List<VirtualDimension> VirtualDimensions { get; set; } = new();
 
     public List<RealColumnTransformation> ColumnTransformations { get; init; } = new();
+    public List<TableRename> TableRenames { get; set; } = new(); // ✅ NOUVEAU
 
 }
 
@@ -78,3 +79,9 @@ public class VirtualDimension
 }
 
 public record RealColumnTransformation(string Table, string OriginalColumn, string NewColumn, string NewColumnType);
+
+public class TableRename
+{
+    public required string StagingTable { get; set; } // nom réel dans le staging, ex. "staging_FactSales"
+    public required string DisplayName { get; set; }   // nom affiché après renommage, ex. "sales"
+}

@@ -639,6 +639,7 @@ async getSchemaAtStep(database: string, sessionId: number, stepNumber: number): 
  * (retire le préfixe staging_, ajoute tableAttributes réelles depuis staging).
  */
 private async buildDotNetSchemaPayload(database: string, dwDatabase: string, rawSchema: any) {
+  const tableRenames: { stagingTable: string; displayName: string }[] = rawSchema.tableRenames ?? [];
   const stripPrefix = (name: string) => name.replace(/^staging_/, '');
 
   const dimensions = (rawSchema.dimensions ?? []).map(stripPrefix).filter((d: string) => d !== 'DimTemps');
@@ -712,14 +713,16 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
       (t) => !virtualFactNames.has(t) && !virtualDimNames.has(t),
     );
 
-    for (const tableName of realTables) {
-      const stagingTable = `staging_${tableName}`;
-      const columnsResult = await pool.request().query(`
-        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = '${stagingTable}'
-        ORDER BY ORDINAL_POSITION
-      `);
+   for (const tableName of realTables) {
+  const renameEntry = tableRenames.find((tr) => tr.displayName === tableName);
+  const stagingTable = renameEntry ? renameEntry.stagingTable : `staging_${tableName}`;
+
+  const columnsResult = await pool.request().query(`
+    SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = '${stagingTable}'
+    ORDER BY ORDINAL_POSITION
+  `);
 
       // ✅ NOUVEAU : applique le renommage/retypage éventuel sur chaque colonne réelle
       const transformsForTable = columnTransformations.filter(
@@ -791,6 +794,8 @@ private async buildDotNetSchemaPayload(database: string, dwDatabase: string, raw
     virtualFacts,
     virtualDimensions,
     columnTransformations, // ✅ AJOUTÉ — transmis à l'API .NET pour l'ETL
+    tableRenames, // ✅ NOUVEAU — sans ça, l'ETL .NET ne sait jamais qu'une table a été renommée
+                  // et cherche "staging_<nomAffichage>" au lieu du vrai nom staging d'origine
   };
 }
 

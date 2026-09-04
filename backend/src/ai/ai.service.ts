@@ -5,18 +5,20 @@ import { Agent } from 'undici';
 export interface AiSchemaProposal {
   dimensions: string[];
   facts: string[];
-  confirmedRelations: CrossTableRelation[];
-  additionalRelations: CrossTableRelation[];
+  confirmedRelations: any[];
+  additionalRelations: any[];
   generatedDimensions: any[];
   factColumnTransformations: any[];
   subDimensions: SubDimension[];
   tableAttributes: Record<string, { name: string; type: string }[]>;
   virtualFacts: VirtualFact[];
-  virtualDimensions: VirtualDimension[]; // ← nouveau
-  rawResponse: string;
-  warnings: string[];
-  excludedColumns: Record<string, string[]>; // { "Employees": ["FirstName"] }
+  virtualDimensions: VirtualDimension[];
+  excludedColumns: Record<string, string[]>;
   columnTransformations: ColumnTransformation[];
+  tableRenames: TableRename[];
+  addedColumns: Record<string, { name: string; type: string }[]>; // ✅ NOUVEAU — colonnes ajoutées à des tables réelles
+  warnings: string[];
+  rawResponse?: string;
 }
 export interface ColumnTransformation {
   table: string;
@@ -30,7 +32,10 @@ export interface SubDimension {
   sourceColumn: string;
   generatedPrimaryKey: string;
 }
-
+export interface TableRename {
+  stagingTable: string; // nom réel dans le staging, ex. "staging_Employees"
+  displayName: string;  // nom affiché après renommage, ex. "emp"
+}
 export interface VirtualFact {
   name: string;
   dimensionNames: string[];
@@ -62,7 +67,86 @@ private stripPrefix(t: unknown): string {
   if (typeof t !== 'string') return '';
   return t.replace(/^staging_/i, '');
 }
+/**
+ * Cherche, parmi toutes les tables connues du schéma (dimensions et faits, réels et virtuels),
+ * celle dont le nom apparaît réellement dans le message utilisateur. Utilisé pour corriger
+ * une hallucination du LLM sur le champ "table"/"dimension"/"fact" plutôt que de rejeter
+ * systématiquement (le LLM 3B a tendance à recopier une table citée dans l'historique récent
+ * au lieu de lire le nouveau message).
+ */
+private resolveTableFromMessage(userMessage: string, schema: any): string | null {
+  const normalize = (s: string) =>
+    s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[_\s-]/g, '');
+  const normalizedMessage = normalize(userMessage);
 
+  const candidates: string[] = [
+    ...(schema.dimensions ?? []).map((d: string) => this.stripPrefix(d)),
+    ...(schema.facts ?? []).map((f: string) => this.stripPrefix(f)),
+  ];
+
+  // Dédoublonne et trie du plus long au plus court, pour qu'un nom plus spécifique
+  // (ex: "SalesTerritory") ne soit pas court-circuité par un nom plus court inclus dedans (ex: "Sales").
+  const uniqueCandidates = [...new Set(candidates)].sort((a, b) => b.length - a.length);
+
+  const matches = uniqueCandidates.filter((c) => normalizedMessage.includes(normalize(c)));
+  if (matches.length === 0) return null;
+  return matches[0];
+}
+/**
+ * Cherche, parmi les colonnes valides d'une table cible donnée (déjà résolue), celle qui
+ * apparaît réellement dans le message utilisateur. Même logique que resolveTableFromMessage,
+ * mais appliquée aux colonnes — corrige l'hallucination du LLM qui recopie un nom de colonne
+ * cité dans un tour précédent (ex: "colA" ajoutée à Resellers) au lieu de lire le nouveau
+ * message ("productName" de Products).
+ */
+private resolveColumnFromMessage(userMessage: string, candidates: string[]): string | null {
+  const normalize = (s: string) =>
+    s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[_\s-]/g, '');
+  const normalizedMessage = normalize(userMessage);
+
+  const uniqueCandidates = [...new Set(candidates)].sort((a, b) => b.length - a.length);
+  const matches = uniqueCandidates.filter((c) => normalizedMessage.includes(normalize(c)));
+  if (matches.length === 0) return null;
+  return matches[0];
+}
+
+/**
+ * Retourne la liste des noms de colonnes valides pour la table cible d'une action donnée,
+ * selon son type (dimension virtuelle, fait virtuel, ou table réelle du staging). Utilisé
+ * uniquement pour l'auto-correction du nom de colonne — ne remplace pas la validation stricte
+ * qui a lieu ensuite dans applyChatAction (colonne "introuvable" reste un filet de sécurité).
+ */
+private getColumnCandidatesForAction(actionType: string, tableFieldValue: string, schema: any): string[] {
+  const stripped = this.stripPrefix(tableFieldValue);
+
+  if (actionType === 'rename_column' || actionType === 'change_column_type') {
+    const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name.toLowerCase() === stripped.toLowerCase());
+    return vd ? (vd.extraColumns ?? []).map((c: any) => c.name) : [];
+  }
+
+  if (actionType === 'rename_fact_measure') {
+    const vf = (schema.virtualFacts ?? []).find((v: any) => v.name.toLowerCase() === stripped.toLowerCase());
+    return vf ? (vf.measures ?? []).map((m: any) => m.name) : [];
+  }
+
+  if (actionType === 'rename_real_column') {
+    const key = Object.keys(schema.tableAttributes ?? {}).find(
+      (k) => this.stripPrefix(k).toLowerCase() === stripped.toLowerCase(),
+    );
+    return key ? (schema.tableAttributes[key] ?? []).map((a: any) => a.name) : [];
+  }
+
+  if (actionType === 'remove_dimension_column') {
+    const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name.toLowerCase() === stripped.toLowerCase());
+    if (vd) return (vd.extraColumns ?? []).map((c: any) => c.name);
+    const key = Object.keys(schema.tableAttributes ?? {}).find(
+      (k) => this.stripPrefix(k).toLowerCase() === stripped.toLowerCase(),
+    );
+    return key ? (schema.tableAttributes[key] ?? []).map((a: any) => a.name) : [];
+  }
+
+  return [];
+}
 // ✅ 1. D'abord les méthodes utilitaires (avant validateAndClean)
   private isLegitimateDerivedDimension(tableName: unknown, hasDateColumn: boolean): boolean {
     if (typeof tableName !== 'string') return false;
@@ -218,7 +302,9 @@ private buildTableAttributes(
   virtualFacts: VirtualFact[] = [],
   virtualDimensions: VirtualDimension[] = [],
   excludedColumns: Record<string, string[]> = {},
-  columnTransformations: ColumnTransformation[] = [], // ✅ NOUVEAU paramètre
+  columnTransformations: ColumnTransformation[] = [],
+  tableRenames: TableRename[] = [],
+  addedColumns: Record<string, { name: string; type: string }[]> = {},
 ): Record<string, { name: string; type: string }[]> {
   const attributes: Record<string, { name: string; type: string }[]> = {};
 
@@ -229,14 +315,27 @@ private buildTableAttributes(
   );
 
   for (const tableName of allRealTables) {
-    const tableMeta = metadata.find((m) => m[0]?.sourceTable === tableName);
+    const renameEntry = tableRenames.find((tr) => tr.displayName === tableName);
+    const stagingLookupName = renameEntry ? renameEntry.stagingTable : tableName;
+
+    const tableMeta = metadata.find((m) => m[0]?.sourceTable === stagingLookupName);
     if (tableMeta) {
-      const excluded = new Set((excludedColumns?.[tableName] ?? []).map((c: string) => c.toLowerCase()));
-      const transformsForTable = columnTransformations.filter(
-        (t) => this.stripPrefix(t.table).toLowerCase() === this.stripPrefix(tableName).toLowerCase(),
+      // ✅ CORRIGÉ (bug capture 1) : excludedColumns est stocké SANS préfixe staging
+      // (ex: "Employees"), mais tableName ici garde le préfixe interne (ex: "staging_Employees").
+      // On cherche donc sous les deux formes, sans jamais dépendre de la casse.
+      const strippedTableName = this.stripPrefix(tableName);
+      const excludedKey = Object.keys(excludedColumns ?? {}).find(
+        (k) => this.stripPrefix(k).toLowerCase() === strippedTableName.toLowerCase(),
+      );
+      const excluded = new Set(
+        (excludedKey ? excludedColumns[excludedKey] : []).map((c: string) => c.toLowerCase()),
       );
 
-      attributes[tableName] = tableMeta
+      const transformsForTable = columnTransformations.filter(
+        (t) => this.stripPrefix(t.table).toLowerCase() === strippedTableName.toLowerCase(),
+      );
+
+      const baseColumns = tableMeta
         .filter((col) => !excluded.has(col.columnName.toLowerCase()))
         .map((col) => {
           const transform = transformsForTable.find((t) => t.originalColumn.toLowerCase() === col.columnName.toLowerCase());
@@ -244,6 +343,14 @@ private buildTableAttributes(
             ? { name: transform.newColumn, type: transform.newColumnType }
             : { name: col.columnName, type: col.dataType };
         });
+
+      // ✅ NOUVEAU : ajoute les colonnes réellement nouvelles (sans équivalent d'origine)
+      const addedKey = Object.keys(addedColumns ?? {}).find(
+        (k) => this.stripPrefix(k).toLowerCase() === strippedTableName.toLowerCase(),
+      );
+      const extra = addedKey ? addedColumns[addedKey] : [];
+
+      attributes[tableName] = [...baseColumns, ...extra];
     }
   }
 
@@ -258,13 +365,13 @@ private buildTableAttributes(
     ];
   }
 
- for (const vf of virtualFacts) {
-  attributes[vf.name] = [
-    { name: `${vf.name}Id`, type: 'INT' },
-    ...vf.dimensionNames.map((d: string) => ({ name: `${d}Id`, type: 'INT' })),
-    ...(vf.measures ?? []),
-  ];
-}
+  for (const vf of virtualFacts) {
+    attributes[vf.name] = [
+      { name: `${vf.name}Id`, type: 'INT' },
+      ...vf.dimensionNames.map((d: string) => ({ name: `${d}Id`, type: 'INT' })),
+      ...(vf.measures ?? []),
+    ];
+  }
 
   for (const vd of virtualDimensions) {
     attributes[vd.name] = [
@@ -627,9 +734,10 @@ private async callOllama(prompt: string): Promise<string> {
         model: this.MODEL,
         prompt,
         stream: true,
-        options: { 
+        options: {
           temperature: 0.1,
-          num_predict: 4096, // Augmenté pour éviter les réponses tronquées
+          num_predict: 4096,
+          num_ctx: 4096, // ✅ NOUVEAU — évite la troncature silencieuse du prompt (défaut Ollama souvent 2048)
         },
       }),
       signal: AbortSignal.timeout(240000),
@@ -663,14 +771,13 @@ private async callOllama(prompt: string): Promise<string> {
       const lines = chunk.split('\n').filter(line => line.trim());
 
       for (const line of lines) {
-        // Ignorer les lignes qui ne commencent pas par { (pas du JSON valide)
         if (!line.trim().startsWith('{')) {
           continue;
         }
 
         try {
           const data = JSON.parse(line);
-          
+
           if (data.response) {
             fullResponse += data.response;
             chunkCount++;
@@ -701,7 +808,7 @@ private async callOllama(prompt: string): Promise<string> {
 
     const totalMs = Date.now() - startedAt;
     const estimatedTokens = Math.round(fullResponse.length / 4);
-    
+
     console.log(`[Ollama] --- RÉSUMÉ STREAMING ---`);
     console.log(`[Ollama] Temps total: ${totalMs} ms`);
     console.log(`[Ollama] Caractères reçus: ${fullResponse.length}`);
@@ -709,7 +816,6 @@ private async callOllama(prompt: string): Promise<string> {
     console.log(`[Ollama] Vitesse: ${Math.round(fullResponse.length / (totalMs / 1000))} caractères/seconde`);
     console.log(`[Ollama] -------------------------`);
 
-    // Nettoyer la réponse des éventuels marqueurs Markdown
     const cleanedResponse = fullResponse
       .replace(/```json\s*/g, '')
       .replace(/```\s*/g, '')
@@ -719,13 +825,13 @@ private async callOllama(prompt: string): Promise<string> {
 
   } catch (err) {
     console.error('[Ollama] Erreur fetch:', err);
-    
+
     if (err.name === 'AbortError' || err.name === 'TimeoutError') {
       throw new InternalServerErrorException(
         `Le modèle Ollama a mis trop de temps à répondre (2 minutes). Vérifie que le modèle "${this.MODEL}" est disponible.`
       );
     }
-    
+
     throw new InternalServerErrorException(
       `Impossible de contacter Ollama sur ${this.OLLAMA_URL}. Vérifie qu'il est bien lancé. Erreur: ${err.message}`
     );
@@ -1509,26 +1615,39 @@ private validateAndClean(
   }
 
   // --- 1. Normalisation des dimensions et faits ---
-const incomingVirtualFactNames = new Set(((parsed as any).virtualFacts ?? []).map((vf: any) => vf.name));
-const incomingVirtualDimNames = new Set(((parsed as any).virtualDimensions ?? []).map((vd: any) => vd.name));
+  const incomingVirtualFactNames = new Set(((parsed as any).virtualFacts ?? []).map((vf: any) => vf.name));
+  const incomingVirtualDimNames = new Set(((parsed as any).virtualDimensions ?? []).map((vd: any) => vd.name));
+  const incomingTableRenames: TableRename[] = (parsed as any).tableRenames ?? [];
+  const renamedDisplayNames = new Set(incomingTableRenames.map((tr) => tr.displayName));
 
-const isKnownOrDerived = (t: string, bucket: string): boolean => {
-  if (validTableNames.has(t)) return true;
-  if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
-    warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
-    return true;
-  }
-  if (bucket === 'facts' && incomingVirtualFactNames.has(t)) {
-    warnings.push(`Fait virtuel accepté (structure sans données source): ${t}`);
-    return true;
-  }
-  if (bucket === 'dimensions' && incomingVirtualDimNames.has(t)) {
-    warnings.push(`Dimension virtuelle acceptée (structure sans données source): ${t}`);
-    return true;
-  }
-  warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
-  return false;
-};
+  // ✅ NOUVEAU : résout le nom staging d'origine d'une table (pour lookup de colonnes),
+  // en tenant compte des renommages. Utilisé par structurallyValid ci-dessous.
+  const resolveStagingNameForColumns = (t: string): string => {
+    const renameEntry = incomingTableRenames.find((tr) => tr.displayName === t);
+    return renameEntry ? this.stripPrefix(renameEntry.stagingTable) : t;
+  };
+
+  const isKnownOrDerived = (t: string, bucket: string): boolean => {
+    if (validTableNames.has(t)) return true;
+    if (this.isLegitimateDerivedDimension(t, hasDateColumn)) {
+      warnings.push(`Dimension dérivée acceptée (générée, absente du staging): ${t}`);
+      return true;
+    }
+    if (bucket === 'facts' && incomingVirtualFactNames.has(t)) {
+      warnings.push(`Fait virtuel accepté (structure sans données source): ${t}`);
+      return true;
+    }
+    if (bucket === 'dimensions' && incomingVirtualDimNames.has(t)) {
+      warnings.push(`Dimension virtuelle acceptée (structure sans données source): ${t}`);
+      return true;
+    }
+    if (renamedDisplayNames.has(t)) {
+      warnings.push(`Table réelle renommée acceptée: ${t}`);
+      return true;
+    }
+    warnings.push(`Table inventée ignorée (${bucket}): ${t}`);
+    return false;
+  };
 
   const normalizedDimensions = parsed.dimensions
     .map((t) => this.normalizeTableEntry(t, validTableNames))
@@ -1573,83 +1692,77 @@ const isKnownOrDerived = (t: string, bucket: string): boolean => {
       cleanFacts.push(candidate);
     }
   }
-// ✅ NOUVEAU : si AUCUN fait n'a pu être identifié (ni par l'IA, ni par l'heuristique),
-// on construit automatiquement une table de fait virtuelle qui relie toutes les dimensions
-// entre elles. Elle reste vide (aucune source staging), à peupler manuellement plus tard.
-// Note : cleanDimensions est encore préfixé (staging_) à ce stade de la méthode, donc
-// virtualFacts.dimensionNames doit être nettoyé explicitement via stripPrefix.
-let autoVirtualFacts: VirtualFact[] = [];
-let autoVirtualFactRelations: any[] = [];
 
-if (cleanFacts.length === 0 && cleanDimensions.length >= 2) {
-  const factName = 'Fact';
-  const strippedDimensionNames = cleanDimensions.map((d) => this.stripPrefix(d));
+  // Si AUCUN fait n'a pu être identifié, on construit automatiquement un fait virtuel
+  let autoVirtualFacts: VirtualFact[] = [];
+  let autoVirtualFactRelations: any[] = [];
 
-  warnings.push(
-    `Aucune table de fait détectée parmi les tables uploadées — "${factName}" créée automatiquement, reliant toutes les dimensions (${strippedDimensionNames.join(', ')}). Cette table est vide et devra être peuplée manuellement.`,
-  );
+  if (cleanFacts.length === 0 && cleanDimensions.length >= 2) {
+    const factName = 'Fact';
+    const strippedDimensionNames = cleanDimensions.map((d) => this.stripPrefix(d));
 
-  cleanFacts.push(factName);
-  autoVirtualFacts.push({ name: factName, dimensionNames: strippedDimensionNames });
+    warnings.push(
+      `Aucune table de fait détectée parmi les tables uploadées — "${factName}" créée automatiquement, reliant toutes les dimensions (${strippedDimensionNames.join(', ')}). Cette table est vide et devra être peuplée manuellement.`,
+    );
 
-  autoVirtualFactRelations = strippedDimensionNames.map((dim) => ({
-    tableA: factName,
-    columnA: `${dim}Id`,
-    tableB: dim,
-    columnB: `${dim}Id`,
-    reason: 'fait_virtuel_genere_automatiquement',
-  }));
-}
+    cleanFacts.push(factName);
+    autoVirtualFacts.push({ name: factName, dimensionNames: strippedDimensionNames });
+
+    autoVirtualFactRelations = strippedDimensionNames.map((dim) => ({
+      tableA: factName,
+      columnA: `${dim}Id`,
+      tableB: dim,
+      columnB: `${dim}Id`,
+      reason: 'fait_virtuel_genere_automatiquement',
+    }));
+  }
 
   // --- 2. Validation structurelle des relations ---
-  // ✅ NOUVEAU : garde-fou de type, avant tout appel à .replace() via stripPrefix,
-  // pour éviter "t.replace is not a function" quand le modèle IA renvoie
-  // un tableA/tableB/columnA/columnB qui n'est pas une chaîne (objet, null, nombre...).
   const structurallyValid = (r: any): boolean => {
-  if (!r || typeof r !== 'object') {
-    warnings.push(`Relation ignorée (format invalide): ${JSON.stringify(r)}`);
-    return false;
-  }
-  if (
-    typeof r.tableA !== 'string' || typeof r.columnA !== 'string' ||
-    typeof r.tableB !== 'string' || typeof r.columnB !== 'string' ||
-    !r.tableA || !r.columnA || !r.tableB || !r.columnB
-  ) {
-    warnings.push(`Relation incomplète ou mal typée ignorée: ${JSON.stringify(r)}`);
-    return false;
-  }
+    if (!r || typeof r !== 'object') {
+      warnings.push(`Relation ignorée (format invalide): ${JSON.stringify(r)}`);
+      return false;
+    }
+    if (
+      typeof r.tableA !== 'string' || typeof r.columnA !== 'string' ||
+      typeof r.tableB !== 'string' || typeof r.columnB !== 'string' ||
+      !r.tableA || !r.columnA || !r.tableB || !r.columnB
+    ) {
+      warnings.push(`Relation incomplète ou mal typée ignorée: ${JSON.stringify(r)}`);
+      return false;
+    }
 
-  r.tableA = this.stripPrefix(r.tableA);
-  r.tableB = this.stripPrefix(r.tableB);
+    r.tableA = this.stripPrefix(r.tableA);
+    r.tableB = this.stripPrefix(r.tableB);
 
-  if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
-    warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
-    return false;
-  }
+    if (r.tableA.toLowerCase().includes('dimtemps') || r.tableB.toLowerCase().includes('dimtemps')) {
+      warnings.push(`Relation vers DimTemps ignorée (générée automatiquement, pas par l'IA)`);
+      return false;
+    }
 
-  // ✅ NOUVEAU : une relation générée pour un fait virtuel référence des colonnes techniques
-  // (ex: CurrenciesId) qui n'existent pas dans le staging — c'est normal, on l'accepte telle quelle.
-if (
-  r.reason === 'fait_virtuel_genere_via_chat' ||
-  r.reason === 'fait_virtuel_genere_automatiquement' ||
-  r.reason === 'dimension_virtuelle_generee_via_chat'
-) return true;
+    if (
+      r.reason === 'fait_virtuel_genere_via_chat' ||
+      r.reason === 'fait_virtuel_genere_automatiquement' ||
+      r.reason === 'dimension_virtuelle_generee_via_chat'
+    ) return true;
 
-  const colsA = normalizedValidColumns.get(r.tableA);
-  if (!colsA || !colsA.has(r.columnA)) {
-    warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
-    return false;
-  }
-  const colsB = normalizedValidColumns.get(r.tableB);
-  if (!colsB || !colsB.has(r.columnB)) {
-    warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
-    return false;
-  }
-  return true;
-};
+    // ✅ CORRIGÉ (bug 4) : résout le nom staging d'origine avant le lookup de colonnes,
+    // pour que les relations d'une table renommée ne soient plus rejetées à tort.
+    const colsA = normalizedValidColumns.get(resolveStagingNameForColumns(r.tableA));
+    if (!colsA || !colsA.has(r.columnA)) {
+      warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableA}.${r.columnA})`);
+      return false;
+    }
+    const colsB = normalizedValidColumns.get(resolveStagingNameForColumns(r.tableB));
+    if (!colsB || !colsB.has(r.columnB)) {
+      warnings.push(`Relation invalide ignorée (colonne inexistante ${r.tableB}.${r.columnB})`);
+      return false;
+    }
+    return true;
+  };
 
   // --- 3. Validation de la constellation ---
-const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations, ...autoVirtualFactRelations].filter(structurallyValid);
+  const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelations, ...autoVirtualFactRelations].filter(structurallyValid);
 
   const cleanFactsStripped = new Set(cleanFacts.map((t) => this.stripPrefix(t)));
   const cleanDimensionsStripped = new Set(cleanDimensions.map((t) => this.stripPrefix(t)));
@@ -1681,10 +1794,10 @@ const allRelationsRaw = [...parsed.confirmedRelations, ...parsed.additionalRelat
   };
 
   // --- 4. Construire les relations confirmées ---
-let confirmedRelations = [...parsed.confirmedRelations, ...autoVirtualFactRelations]
-  .filter(structurallyValid)
-  .filter(isValidRelation)
-  .map((r: any) => ({ ...r, reason: r.reason || 'relation_confirmee_par_ia' }));
+  let confirmedRelations = [...parsed.confirmedRelations, ...autoVirtualFactRelations]
+    .filter(structurallyValid)
+    .filter(isValidRelation)
+    .map((r: any) => ({ ...r, reason: r.reason || 'relation_confirmee_par_ia' }));
 
   let additionalRelations = parsed.additionalRelations
     .filter(structurallyValid)
@@ -1748,9 +1861,23 @@ let confirmedRelations = [...parsed.confirmedRelations, ...autoVirtualFactRelati
   }
 
   // --- 8. Génération automatique de DimTemps ---
+    // --- 8. Génération automatique de DimTemps ---
+  // ✅ CORRIGÉ (bug capture 2) : après un renommage de table, cleanFacts contient le
+  // NOUVEAU nom ("sales"), qui ne correspond plus à aucun sourceTable des métadonnées
+  // ("staging_FactSales"). On résout donc le vrai nom staging via tableRenames avant
+  // de chercher la colonne date, sinon DimTemps et sa relation sont recréés vides.
+  const resolveOriginalStagingSourceName = (name: string): string => {
+    const stripped = this.stripPrefix(name);
+    const renameEntry = incomingTableRenames.find(
+      (tr) => tr.displayName.toLowerCase() === stripped.toLowerCase() || tr.displayName.toLowerCase() === name.toLowerCase(),
+    );
+    return renameEntry ? this.stripPrefix(renameEntry.stagingTable) : stripped;
+  };
+
   const factsWithDate = cleanFacts
     .map((factName) => {
-      const factMeta = metadata.find((table) => table[0]?.sourceTable === factName);
+      const resolvedName = resolveOriginalStagingSourceName(factName);
+      const factMeta = metadata.find((table) => this.stripPrefix(table[0]?.sourceTable ?? '').toLowerCase() === resolvedName.toLowerCase());
       const dateCol = factMeta?.find((col) => col.dataType.toLowerCase().includes('date'));
       return dateCol ? { factName, dateCol } : null;
     })
@@ -1781,6 +1908,12 @@ let confirmedRelations = [...parsed.confirmedRelations, ...autoVirtualFactRelati
         `Structure DimTemps liée à ${factName} : ${dateCol.columnName} → ${factTransformation.newColumn} (FK vers DimTemps.DateKey)`,
       );
     }
+  } else if (dimTempsPresent && factsWithDate.length === 0) {
+    // ✅ NOUVEAU : trace explicite si DimTemps existe mais qu'aucune colonne date n'a pu
+    // être retrouvée pour aucun fait — utile pour diagnostiquer un futur cas similaire.
+    warnings.push(
+      `DimTemps présente dans le schéma mais aucune colonne date retrouvée pour les faits actuels (${cleanFacts.join(', ')}) — vérifie les renommages de tables.`,
+    );
   }
 
   // --- 8.5. Purge des relations vers des tables non classées ---
@@ -1842,55 +1975,44 @@ let confirmedRelations = [...parsed.confirmedRelations, ...autoVirtualFactRelati
   }
 
   // --- 10. Construction des attributs des tables ---
-// const virtualFacts: VirtualFact[] = [...((parsed as any).virtualFacts ?? []), ...autoVirtualFacts];
-// const virtualDimensions: VirtualDimension[] = (parsed as any).virtualDimensions ?? [];
+  const virtualFacts: VirtualFact[] = [...((parsed as any).virtualFacts ?? []), ...autoVirtualFacts];
+  const virtualDimensions: VirtualDimension[] = (parsed as any).virtualDimensions ?? [];
 
-// const columnTransformations: ColumnTransformation[] = (parsed as any).columnTransformations ?? [];
+  const columnTransformations: ColumnTransformation[] = (parsed as any).columnTransformations ?? [];
+  const excludedColumns = (parsed as any).excludedColumns ?? {};
+  const addedColumns: Record<string, { name: string; type: string }[]> = (parsed as any).addedColumns ?? {}; // ✅ NOUVEAU
 
-// const tableAttributes = this.buildTableAttributes(
-//   cleanDimensions,
-//   cleanFacts,
-//   metadata,
-//   generatedDimensions,
-//   subDimensions,
-//   virtualFacts,
-//   virtualDimensions,
-//   undefined, // excludedColumns déjà géré séparément plus bas, garde ta valeur existante ici
-//   columnTransformations,
-// );
-// const excludedColumns = (parsed as any).excludedColumns ?? {};
-const virtualFacts: VirtualFact[] = [...((parsed as any).virtualFacts ?? []), ...autoVirtualFacts];
-const virtualDimensions: VirtualDimension[] = (parsed as any).virtualDimensions ?? [];
-const columnTransformations: ColumnTransformation[] = (parsed as any).columnTransformations ?? [];
-const excludedColumns = (parsed as any).excludedColumns ?? {}; // ✅ calculé AVANT
+  const tableAttributes = this.buildTableAttributes(
+    cleanDimensions,
+    cleanFacts,
+    metadata,
+    generatedDimensions,
+    subDimensions,
+    virtualFacts,
+    virtualDimensions,
+    excludedColumns,
+    columnTransformations,
+    incomingTableRenames,
+    addedColumns, // ✅ NOUVEAU
+  );
 
-const tableAttributes = this.buildTableAttributes(
-  cleanDimensions,
-  cleanFacts,
-  metadata,
-  generatedDimensions,
-  subDimensions,
-  virtualFacts,
-  virtualDimensions,
-  excludedColumns, // ✅ la vraie valeur, plus undefined
-  columnTransformations,
-);
-  // --- 11. Retourner le résultat ---
-return {
-  dimensions: cleanDimensions,
-  facts: cleanFacts,
-  confirmedRelations: finalConfirmedRelationsClean,
-  additionalRelations: additionalRelationsClean,
-  generatedDimensions,
-  factColumnTransformations,
-  subDimensions,
-  tableAttributes,
-  virtualFacts,
-  virtualDimensions,
-  excludedColumns,
-  columnTransformations,
-  warnings,
-};
+  return {
+    dimensions: cleanDimensions,
+    facts: cleanFacts,
+    confirmedRelations: finalConfirmedRelationsClean,
+    additionalRelations: additionalRelationsClean,
+    generatedDimensions,
+    factColumnTransformations,
+    subDimensions,
+    tableAttributes,
+    virtualFacts,
+    virtualDimensions,
+    excludedColumns,
+    columnTransformations,
+    tableRenames: incomingTableRenames,
+    addedColumns, // ✅ NOUVEAU
+    warnings,
+  };
 }
 // private buildChatPrompt(currentSchema: any, userMessage: string): string {
 //   return `Tu es un assistant qui aide à valider un schéma de data warehouse en dialoguant avec l'utilisateur.
@@ -2245,7 +2367,7 @@ case 'remove_dimension_column': {
   const dimName = action.dimension;
   const colName = action.column;
 
-  // Cas 1 : dimension virtuelle -> retire la colonne de virtualDimensions (comportement existant)
+  // Cas 1 : dimension virtuelle -> retire la colonne de virtualDimensions
   const vd = (schema.virtualDimensions ?? []).find((v: any) => v.name.toLowerCase() === String(dimName).toLowerCase());
   if (vd) {
     const before = (vd.extraColumns ?? []).length;
@@ -2260,12 +2382,17 @@ case 'remove_dimension_column': {
   }
 
   // Cas 2 : dimension réelle -> exclut la colonne du DW final (données conservées en staging)
-  const realDimExists = (schema.dimensions ?? []).some((d: string) => this.stripPrefix(d) === this.stripPrefix(dimName));
-  if (!realDimExists) {
+  // ✅ CORRIGÉ (bug capture 1) : recherche insensible à la casse, et on garde le nom RÉEL
+  // trouvé (avec sa casse d'origine) comme clé de stockage, pour que buildTableAttributes
+  // puisse la retrouver de façon fiable (via stripPrefix + lowercase des deux côtés).
+  const realDimMatch = (schema.dimensions ?? []).find(
+    (d: string) => this.stripPrefix(d).toLowerCase() === this.stripPrefix(dimName).toLowerCase(),
+  );
+  if (!realDimMatch) {
     return { newSchema: schema, deterministicExplanation: `Dimension "${dimName}" introuvable, aucun changement.`, changed: false };
   }
 
-  const strippedDim = this.stripPrefix(dimName);
+  const strippedDim = this.stripPrefix(realDimMatch);
   schema.excludedColumns = schema.excludedColumns ?? {};
   const currentExcluded = schema.excludedColumns[strippedDim] ?? [];
   if (currentExcluded.some((c: string) => c.toLowerCase() === String(colName).toLowerCase())) {
@@ -2317,6 +2444,60 @@ case 'add_dimension_column': {
     changed: true,
   };
 }
+case 'add_real_column': {
+  const tableName = action.table;
+  const column = { name: action.columnName, type: action.columnType };
+
+  if (typeof column.name !== 'string' || typeof column.type !== 'string' || !column.name || !column.type) {
+    return { newSchema: schema, deterministicExplanation: `Colonne mal spécifiée, aucun changement.`, changed: false };
+  }
+
+  const strippedTable = this.stripPrefix(tableName);
+  const isRealDim = (schema.dimensions ?? []).some((d: string) => this.stripPrefix(d).toLowerCase() === strippedTable.toLowerCase());
+  const isRealFact = (schema.facts ?? []).some((f: string) => this.stripPrefix(f).toLowerCase() === strippedTable.toLowerCase());
+  const isVirtual = (schema.virtualDimensions ?? []).some((vd: any) => vd.name.toLowerCase() === strippedTable.toLowerCase())
+    || (schema.virtualFacts ?? []).some((vf: any) => vf.name.toLowerCase() === strippedTable.toLowerCase());
+
+  if ((!isRealDim && !isRealFact) || isVirtual) {
+    return {
+      newSchema: schema,
+      deterministicExplanation: `Table réelle "${tableName}" introuvable (utilise add_dimension_column/add_fact_column pour une table virtuelle), aucun changement.`,
+      changed: false,
+    };
+  }
+
+  const normalize = (s: string) => s.toLowerCase().replace(/[_\s-]/g, '');
+  if (!normalize(userMessage).includes(normalize(column.name))) {
+    console.warn(`[applyChatAction] add_real_column: colonne "${column.name}" rejetée, non mentionnée dans "${userMessage}"`);
+    return { newSchema: schema, deterministicExplanation: `Impossible de confirmer la colonne "${column.name}" à partir du message, aucun changement.`, changed: false };
+  }
+
+  // Vérifie qu'une colonne de ce nom n'existe pas déjà réellement dans le staging
+  const existingAttrs = (schema.tableAttributes ?? {})[strippedTable]
+    ?? (schema.tableAttributes ?? {})[tableName]
+    ?? [];
+  const alreadyExistsInStaging = existingAttrs.some((a: any) => a.name.toLowerCase() === column.name.toLowerCase());
+  if (alreadyExistsInStaging) {
+    return {
+      newSchema: schema,
+      deterministicExplanation: `La colonne "${column.name}" existe déjà dans "${tableName}" — utilise plutôt un renommage/changement de type si tu veux la modifier.`,
+      changed: false,
+    };
+  }
+
+  schema.addedColumns = schema.addedColumns ?? {};
+  const current = schema.addedColumns[strippedTable] ?? [];
+  if (current.some((c: any) => c.name.toLowerCase() === column.name.toLowerCase())) {
+    return { newSchema: schema, deterministicExplanation: `La colonne "${column.name}" est déjà présente dans "${tableName}", aucun changement.`, changed: false };
+  }
+  schema.addedColumns[strippedTable] = [...current, column];
+
+  return {
+    newSchema: schema,
+    deterministicExplanation: `Colonne "${column.name}" (${column.type}) ajoutée à "${tableName}" (colonne vide, à peupler manuellement).`,
+    changed: true,
+  };
+}
 
 case 'rename_table': {
   const oldName = action.oldName;
@@ -2339,16 +2520,31 @@ case 'rename_table': {
     return { newSchema: schema, deterministicExplanation: `Le nom "${newName}" est déjà utilisé, aucun changement.`, changed: false };
   }
 
-  // Empêche tout conflit avec le mécanisme automatique DimTemps
   if (newName.toLowerCase().includes('dimtemps') || oldName.toLowerCase() === 'dimtemps') {
     return { newSchema: schema, deterministicExplanation: `Impossible de renommer "${oldName}" : ce nom est réservé au mécanisme automatique de dimension temporelle.`, changed: false };
   }
 
-  // Renomme dans dimensions / facts
+  // ✅ NOUVEAU : pour une table RÉELLE (pas virtuelle), on garde la trace de son vrai nom
+  // staging d'origine. Sans ça, validateAndClean rejette le nouveau nom comme "table inventée"
+  // (il ne correspond plus à aucune table du staging), et la table disparaît du schéma.
+  const isVirtualDim = schema.virtualDimensions?.some((vd: any) => vd.name === oldName);
+  const isVirtualFact = schema.virtualFacts?.some((vf: any) => vf.name === oldName);
+
+  if (!isVirtualDim && !isVirtualFact) {
+    // Gère les renommages en chaîne : si "oldName" est déjà un nom d'affichage issu
+    // d'un renommage précédent, on retrouve le VRAI nom staging d'origine.
+    const existingRename = (schema.tableRenames ?? []).find((tr: any) => tr.displayName === oldName);
+    const stagingTable = existingRename ? existingRename.stagingTable : oldName;
+
+    schema.tableRenames = [
+      ...(schema.tableRenames ?? []).filter((tr: any) => tr.displayName !== oldName),
+      { stagingTable, displayName: newName },
+    ];
+  }
+
   schema.dimensions = (schema.dimensions ?? []).map((d: string) => (d === oldName ? newName : d));
   schema.facts = (schema.facts ?? []).map((f: string) => (f === oldName ? newName : f));
 
-  // Renomme dans confirmedRelations / additionalRelations
   const renameInRelations = (relations: any[]) =>
     (relations ?? []).map((r: any) => ({
       ...r,
@@ -2358,33 +2554,34 @@ case 'rename_table': {
   schema.confirmedRelations = renameInRelations(schema.confirmedRelations);
   schema.additionalRelations = renameInRelations(schema.additionalRelations);
 
-  // Renomme dans virtualDimensions (nom + linkedFact)
   schema.virtualDimensions = (schema.virtualDimensions ?? []).map((vd: any) => ({
     ...vd,
     name: vd.name === oldName ? newName : vd.name,
     linkedFact: vd.linkedFact === oldName ? newName : vd.linkedFact,
   }));
 
-  // Renomme dans virtualFacts (nom + dimensionNames)
   schema.virtualFacts = (schema.virtualFacts ?? []).map((vf: any) => ({
     ...vf,
     name: vf.name === oldName ? newName : vf.name,
     dimensionNames: (vf.dimensionNames ?? []).map((d: string) => (d === oldName ? newName : d)),
   }));
 
-  // Renomme dans subDimensions (parentDimension)
   schema.subDimensions = (schema.subDimensions ?? []).map((sd: any) => ({
     ...sd,
     parentDimension: sd.parentDimension === oldName ? newName : sd.parentDimension,
   }));
 
-  // Renomme dans factColumnTransformations (factTable)
   schema.factColumnTransformations = (schema.factColumnTransformations ?? []).map((t: any) => ({
     ...t,
     factTable: t.factTable === oldName ? newName : t.factTable,
   }));
 
-  // Renomme dans excludedColumns (clé)
+  // ✅ NOUVEAU : propage le renommage aux transformations de colonnes déjà existantes sur cette table
+  schema.columnTransformations = (schema.columnTransformations ?? []).map((t: any) => ({
+    ...t,
+    table: t.table === oldName ? newName : t.table,
+  }));
+
   if (schema.excludedColumns?.[oldName]) {
     schema.excludedColumns = { ...schema.excludedColumns };
     schema.excludedColumns[newName] = schema.excludedColumns[oldName];
@@ -2507,15 +2704,28 @@ case 'rename_real_column': {
     return { newSchema: schema, deterministicExplanation: `Table "${tableName}" introuvable, aucun changement.`, changed: false };
   }
 
-  const strippedTable = this.stripPrefix(tableName);
+  // ✅ CORRIGÉ (bug 1) : recherche la clé RÉELLE de tableAttributes en insensible à la casse,
+  // au lieu de comparer strippedTableRaw (casse du LLM) directement à des clés qui gardent
+  // la casse d'origine du staging (ex: "Products" vs "products").
+  const strippedTableRaw = this.stripPrefix(tableName);
+  const actualTableKey = Object.keys(schema.tableAttributes ?? {}).find(
+    (k) => this.stripPrefix(k).toLowerCase() === strippedTableRaw.toLowerCase(),
+  ) ?? strippedTableRaw;
+  const strippedTable = actualTableKey;
+
   const existingAttrs = (schema.tableAttributes ?? {})[strippedTable] ?? [];
   const originalAttr = existingAttrs.find((a: any) => a.name.toLowerCase() === oldColumn.toLowerCase());
   if (!originalAttr) {
     return { newSchema: schema, deterministicExplanation: `Colonne "${oldColumn}" introuvable dans "${tableName}", aucun changement.`, changed: false };
   }
 
-  const finalNewColumn = newColumn ?? oldColumn;
+  const finalNewColumn = newColumn ?? originalAttr.name;
   const finalNewType = newType ?? originalAttr.type;
+
+  // ✅ CORRIGÉ (bug 2, en profondeur) : si finalNewColumn ne diffère du nom d'origine que par
+  // la casse, on ne le traite PAS comme un renommage réel dans le message — uniquement dans les
+  // données internes (le stockage garde la nouvelle casse, mais l'explication reste honnête).
+  const isActualRename = newColumn !== null && finalNewColumn.toLowerCase() !== originalAttr.name.toLowerCase();
 
   // Une seule transformation active par (table, colonne source) : on remplace si elle existe déjà
   schema.columnTransformations = (schema.columnTransformations ?? []).filter(
@@ -2527,8 +2737,9 @@ case 'rename_real_column': {
   ];
 
   const parts: string[] = [];
-  if (newColumn) parts.push(`renommée en "${finalNewColumn}"`);
+  if (isActualRename) parts.push(`renommée en "${finalNewColumn}"`);
   if (newType) parts.push(`type changé en "${finalNewType}"`);
+  if (parts.length === 0) parts.push('mise à jour (aucun changement visible détecté)');
 
   return {
     newSchema: schema,
@@ -2612,6 +2823,7 @@ case 'rename_fact_measure': {
     changed: true,
   };
 }
+
 
     default:
       return { newSchema: schema, deterministicExplanation: '', changed: false };
@@ -2713,6 +2925,11 @@ If it is a QUESTION or you are not 100% sure it is a modification request target
 
 ⚠️ CRITICAL: "crée/créer une [nouvelle] table de fait [nommée X]" is ALWAYS "create_fact_table", NEVER "add_fact_column" — even if the message also mentions a measure name. Example: "crée un fait Ventes relié à Products et Resellers avec une mesure Montant en décimal" -> {"action":"create_fact_table","name":"Ventes","dimensions":["Products","Resellers"],"measures":[{"name":"Montant","type":"DECIMAL(18,4)"}],"reply":"..."}. Use "add_fact_column" ONLY when the user refers to a fact table that ALREADY appears in "Facts" above, without asking to create a new one.
 
+⚠️ CRITICAL: "ajoute une colonne X à Y" means a BRAND NEW column with no prior data.
+- If Y appears in "Real table columns" -> use "add_real_column" (NEVER "rename_real_column", which is ONLY for renaming/retyping a column that ALREADY exists).
+- If Y appears in "Virtual dimension columns" -> use "add_dimension_column".
+- If Y appears in "Virtual fact columns" -> use "add_fact_column".
+
 Examples of what "answer_question" is for (do NOT touch the schema for these):
 - "what is a star schema?" -> answer_question
 - "explain the difference between X and Y" -> answer_question
@@ -2733,14 +2950,15 @@ Available actions for ACTUAL modifications:
 - {"action":"create_dimension","name":"DimName","linkedFact":"FactName","columns":[{"name":"colName","type":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)"}],"reply":"..."} — create a NEW empty dimension table linked to an EXISTING fact table. "columns" is OPTIONAL: only include extra columns explicitly requested by the user (besides the automatic primary key). Map data types mentioned in French to SQL types (e.g. "salaire"/"montant" -> DECIMAL(18,4), "nombre"/"entier" -> INT, "texte"/"nom" -> VARCHAR(255), "date" -> DATE).
 - {"action":"remove_dimension_column","dimension":"DimName","column":"colName","reply":"..."} — remove an extra column from a VIRTUAL dimension only (never removes the automatic primary key)
 - {"action":"add_dimension_column","dimension":"DimName","columnName":"colName","columnType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — add a new column to an EXISTING virtual dimension.
+- {"action":"add_real_column","table":"TableName","columnName":"colName","columnType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — add a brand NEW column (no existing source) to a table from "Real table columns" list.
 - {"action":"rename_table","oldName":"OldName","newName":"NewName","reply":"..."} — rename an EXISTING dimension or fact table (virtual or real).
 - {"action":"rename_column","table":"DimName","oldColumn":"oldColName","newColumn":"newColName","reply":"..."} — rename a column ONLY in a VIRTUAL dimension (from "Virtual dimension columns" list).
 - {"action":"change_column_type","table":"DimName","column":"colName","newType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — change the type of a column ONLY in a VIRTUAL dimension (from "Virtual dimension columns" list).
-- {"action":"rename_real_column","table":"TableName","oldColumn":"oldColName","newColumn":"newColName","newType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — rename AND/OR retype a column from a REAL staging table (from "Real table columns" list). "table" and "oldColumn" MUST match that list exactly. "newColumn" and "newType" are each OPTIONAL (provide at least one): omit "newColumn" to keep the name and only change the type, omit "newType" to keep the type and only rename.
+- {"action":"rename_real_column","table":"TableName","oldColumn":"oldColName","newColumn":"newColName","newType":"INT|VARCHAR(255)|DATE|DECIMAL(18,4)","reply":"..."} — rename AND/OR retype a column that ALREADY EXISTS in a REAL staging table (from "Real table columns" list). "table" and "oldColumn" MUST match that list exactly. "newColumn" and "newType" are each OPTIONAL (provide at least one): omit "newColumn" to keep the name and only change the type, omit "newType" to keep the type and only rename.
 
 ⚠️ CRITICAL ROUTING RULE:
 - If the target table appears in "Virtual dimension columns" -> use "rename_column" or "change_column_type".
-- If the target table appears in "Real table columns" -> use "rename_real_column" (works for rename, retype, or both at once).
+- If the target table appears in "Real table columns" -> use "rename_real_column" for an EXISTING column, or "add_real_column" for a BRAND NEW column.
 - Never use "rename_column"/"change_column_type" for a table listed only in "Real table columns".
 
 Rules:
@@ -2751,7 +2969,6 @@ Rules:
 
 ⚠️ Reply ONLY with valid JSON for ONE action, nothing else.`;
 }
-
 
   private computeDiffExplanation(oldSchema: any, newSchema: any): string {
   const changes: string[] = [];
@@ -3141,6 +3358,34 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
 
   const prompt = this.buildChatPrompt(internalCurrentSchema, userMessage, recentExchanges);
 
+  const normalizeForMatch = (s: string) =>
+    s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[_\s-]/g, '');
+
+  const TABLE_FIELD_BY_ACTION: Record<string, string> = {
+    move_to_fact: 'table',
+    move_to_dimension: 'table',
+    remove_dimension: 'table',
+    remove_fact: 'table',
+    remove_dimension_column: 'dimension',
+    add_dimension_column: 'dimension',
+    add_fact_column: 'fact',
+    add_real_column: 'table',
+    rename_table: 'oldName',
+    rename_column: 'table',
+    change_column_type: 'table',
+    rename_real_column: 'table',
+    rename_fact_measure: 'fact',
+    create_dimension: 'linkedFact',
+  };
+
+  const COLUMN_FIELD_BY_ACTION: Record<string, string> = {
+    remove_dimension_column: 'column',
+    rename_column: 'oldColumn',
+    change_column_type: 'column',
+    rename_real_column: 'oldColumn',
+    rename_fact_measure: 'oldColumn',
+  };
+
   let lastError: string | null = null;
   for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
     try {
@@ -3209,12 +3454,36 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
         };
       }
 
+      // Auto-correction de la table cible AVANT toute redirection/validation.
+      const tableField = TABLE_FIELD_BY_ACTION[action.action];
+      if (tableField && typeof action[tableField] === 'string' && action[tableField].trim()) {
+        const strippedCurrent = this.stripPrefix(action[tableField]);
+        const currentMatchesMessage = normalizeForMatch(userMessage).includes(normalizeForMatch(strippedCurrent));
+
+        if (!currentMatchesMessage) {
+          const resolved = this.resolveTableFromMessage(userMessage, internalCurrentSchema);
+          if (resolved) {
+            console.warn(`[applyChatModification] Table "${action[tableField]}" absente du message — corrigée automatiquement en "${resolved}".`);
+            action[tableField] = resolved;
+          }
+        }
+      }
+
       if (action.action === 'add_dimension_column') {
         const targetName = action.dimension;
         const existsAsReal = internalCurrentSchema.dimensions?.some((d: string) => this.stripPrefix(d) === this.stripPrefix(targetName));
         const existsAsVirtual = internalCurrentSchema.virtualDimensions?.some((vd: any) => vd.name === targetName);
 
-        if (!existsAsReal && !existsAsVirtual && (internalCurrentSchema.facts ?? []).length >= 1) {
+        if (existsAsReal && !existsAsVirtual) {
+          console.warn(`[applyChatModification] "${targetName}" est une table réelle — reclassé de add_dimension_column vers add_real_column.`);
+          action = {
+            action: 'add_real_column',
+            table: this.stripPrefix(targetName),
+            columnName: action.columnName,
+            columnType: action.columnType,
+            reply: action.reply,
+          };
+        } else if (!existsAsReal && !existsAsVirtual && (internalCurrentSchema.facts ?? []).length >= 1) {
           console.warn(`[applyChatModification] "${targetName}" inconnue — reclassé de add_dimension_column vers create_dimension.`);
           action = {
             action: 'create_dimension',
@@ -3231,7 +3500,18 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
         const existsAsVirtualFact = internalCurrentSchema.virtualFacts?.some(
           (vf: any) => vf.name.toLowerCase() === String(targetFactName).toLowerCase(),
         );
-        if (!existsAsVirtualFact) {
+        const existsAsReal = internalCurrentSchema.facts?.some((f: string) => this.stripPrefix(f).toLowerCase() === this.stripPrefix(targetFactName).toLowerCase());
+
+        if (existsAsReal && !existsAsVirtualFact) {
+          console.warn(`[applyChatModification] "${targetFactName}" est un fait réel — reclassé de add_fact_column vers add_real_column.`);
+          action = {
+            action: 'add_real_column',
+            table: this.stripPrefix(targetFactName),
+            columnName: action.columnName,
+            columnType: action.columnType,
+            reply: action.reply,
+          };
+        } else if (!existsAsVirtualFact) {
           console.warn(`[applyChatModification] Fait "${targetFactName}" introuvable pour add_fact_column, action ignorée.`);
           return {
             updatedSchema: currentSchema,
@@ -3241,8 +3521,6 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
         }
       }
 
-      // ✅ CORRIGÉ (Correctif 2) : distingue maintenant fait virtuel / dimension virtuelle / table réelle
-      // avant de choisir où rediriger rename_column / change_column_type.
       if (action.action === 'rename_column' || action.action === 'change_column_type') {
         const targetTable = action.table;
         const strippedTarget = this.stripPrefix(targetTable).toLowerCase();
@@ -3254,14 +3532,17 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
           (vf: any) => vf.name.toLowerCase() === strippedTarget,
         );
 
+        const carriedNewColumn = action.action === 'rename_column' ? action.newColumn : undefined;
+        const carriedNewType = action.action === 'change_column_type' ? action.newType : undefined;
+
         if (isVirtualFact) {
           console.warn(`[applyChatModification] "${action.action}" redirigé vers "rename_fact_measure" : "${targetTable}" est un fait virtuel.`);
           action = {
             action: 'rename_fact_measure',
             fact: this.stripPrefix(targetTable),
             oldColumn: action.oldColumn ?? action.column,
-            newColumn: action.newColumn,
-            newType: action.newType,
+            newColumn: carriedNewColumn,
+            newType: carriedNewType,
             reply: action.reply,
           };
         } else if (!isVirtualDim) {
@@ -3270,10 +3551,30 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
             action: 'rename_real_column',
             table: this.stripPrefix(targetTable),
             oldColumn: action.oldColumn ?? action.column,
-            newColumn: action.newColumn,
-            newType: action.newType,
+            newColumn: carriedNewColumn,
+            newType: carriedNewType,
             reply: action.reply,
           };
+        }
+      }
+
+      // Auto-correction du nom de COLONNE cible, une fois l'action et la table définitivement fixées.
+      const columnField = COLUMN_FIELD_BY_ACTION[action.action];
+      if (columnField && typeof action[columnField] === 'string' && action[columnField].trim()) {
+        const columnMatchesMessage = normalizeForMatch(userMessage).includes(normalizeForMatch(action[columnField]));
+
+        if (!columnMatchesMessage) {
+          const finalTableFieldForColumn = TABLE_FIELD_BY_ACTION[action.action];
+          const targetTableValue = finalTableFieldForColumn ? action[finalTableFieldForColumn] : null;
+
+          if (targetTableValue) {
+            const candidates = this.getColumnCandidatesForAction(action.action, targetTableValue, internalCurrentSchema);
+            const resolvedColumn = this.resolveColumnFromMessage(userMessage, candidates);
+            if (resolvedColumn) {
+              console.warn(`[applyChatModification] Colonne "${action[columnField]}" absente du message — corrigée automatiquement en "${resolvedColumn}".`);
+              action[columnField] = resolvedColumn;
+            }
+          }
         }
       }
 
@@ -3288,6 +3589,34 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
           explanation: "Je n'ai pas compris de demande de suppression claire, peux-tu reformuler ?",
           schemaChanged: false,
         };
+      }
+
+      const NON_REMOVAL_ACTIONS_WHEN_REMOVAL_EXPECTED = [
+        'rename_column', 'rename_table', 'change_column_type',
+        'add_dimension_column', 'add_fact_column', 'add_real_column',
+        'rename_real_column', 'rename_fact_measure',
+        'create_dimension', 'create_fact_table',
+      ];
+      if (messageHasRemovalIntent && NON_REMOVAL_ACTIONS_WHEN_REMOVAL_EXPECTED.includes(action.action)) {
+        console.warn(`[applyChatModification] Le message demande une suppression mais le LLM a répondu "${action.action}" — rejeté.`);
+        return {
+          updatedSchema: currentSchema,
+          explanation: "Ta demande semble être une suppression, mais je n'ai pas pu l'identifier avec certitude. Peux-tu préciser le nom exact de la colonne/table à supprimer ?",
+          schemaChanged: false,
+        };
+      }
+
+      const finalTableField = TABLE_FIELD_BY_ACTION[action.action];
+      if (finalTableField && typeof action[finalTableField] === 'string' && action[finalTableField].trim()) {
+        const strippedFinal = this.stripPrefix(action[finalTableField]);
+        if (!normalizeForMatch(userMessage).includes(normalizeForMatch(strippedFinal))) {
+          console.warn(`[applyChatModification] Action "${action.action}" rejetée : cible "${action[finalTableField]}" absente du message et non résolvable.`);
+          return {
+            updatedSchema: currentSchema,
+            explanation: `Je ne trouve pas la table visée dans ton message. Peux-tu préciser son nom exact ?`,
+            schemaChanged: false,
+          };
+        }
       }
 
       if (action.action === 'answer_question' || action.action === 'unsupported' || action.action === 'none') {
@@ -3319,6 +3648,8 @@ Réponds STRICTEMENT en JSON : {"reply":"ta réponse ici"}`;
           virtualDimensions: newSchema.virtualDimensions ?? [],
           excludedColumns: newSchema.excludedColumns ?? {},
           columnTransformations: newSchema.columnTransformations ?? [],
+          tableRenames: newSchema.tableRenames ?? [],
+          addedColumns: newSchema.addedColumns ?? {},
         } as any,
         validTableNames,
         validColumnsByTable,

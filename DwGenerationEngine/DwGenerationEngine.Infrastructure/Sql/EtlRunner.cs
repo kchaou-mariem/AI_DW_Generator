@@ -36,7 +36,7 @@ public class EtlRunner : IEtlRunner
             // 2. SubDimensions : valeurs distinctes extraites DIRECTEMENT DU STAGING (vraie déduplication)
             foreach (var sd in schema.SubDimensions)
             {
-                var tableResult = await LoadSubDimensionAsync(connection, transaction, schema.StagingDatabase, sd);
+                var tableResult = await LoadSubDimensionAsync(connection, transaction, schema.StagingDatabase, sd, schema.TableRenames);
                 result.Tables.Add(tableResult);
             }
 
@@ -57,7 +57,8 @@ public class EtlRunner : IEtlRunner
 
                 var attributes = schema.TableAttributes.GetValueOrDefault(dimName, new List<TableAttribute>());
                 var subDimsForThisTable = schema.SubDimensions.Where(sd => sd.ParentDimension == dimName).ToList();
-                var tableResult = await LoadSimpleDimensionAsync(connection, transaction, schema.StagingDatabase, dimName, attributes, subDimsForThisTable, schema.ColumnTransformations);                result.Tables.Add(tableResult);
+                var tableResult = await LoadSimpleDimensionAsync(connection, transaction, schema.StagingDatabase, dimName, attributes, subDimsForThisTable, schema.ColumnTransformations, schema.TableRenames);
+                result.Tables.Add(tableResult);
             }
 
             // 4. Faits : lookup des clés naturelles -> clés de substitution
@@ -82,7 +83,7 @@ public class EtlRunner : IEtlRunner
     var factLinks = allFactLinks.Where(l => l.FactTable == factName).ToList();
 
     var tableResult = await LoadFactTableAsync(
-    connection, transaction, schema.StagingDatabase, factName, attributes, transformations, factLinks, schema.ColumnTransformations);
+    connection, transaction, schema.StagingDatabase, factName, attributes, transformations, factLinks, schema.ColumnTransformations, schema.TableRenames);
     result.Tables.Add(tableResult);
 }
 
@@ -103,6 +104,17 @@ public class EtlRunner : IEtlRunner
     // ---------- Utilitaire de nommage staging ----------
 
     private static string StagingTableName(string dwTableName) => $"staging_{dwTableName}";
+
+    // ✅ NOUVEAU : résout le VRAI nom de table staging d'une table du DW, en tenant compte
+    // des renommages effectués via le chat. Sans ça, une table renommée (ex: "FactSales" -> "sales")
+    // fait chercher l'ETL dans "staging_sales" (qui n'existe pas) au lieu de "staging_FactSales".
+    private static string ResolveStagingTableName(string dwTableName, List<TableRename>? tableRenames)
+    {
+        var renameEntry = tableRenames?.FirstOrDefault(tr =>
+            string.Equals(tr.DisplayName, dwTableName, StringComparison.OrdinalIgnoreCase));
+
+        return renameEntry != null ? renameEntry.StagingTable : StagingTableName(dwTableName);
+    }
 
     // ---------- DELETE (vidage avant rechargement) ----------
 
@@ -147,8 +159,10 @@ public class EtlRunner : IEtlRunner
             };
         }
 
+        // ✅ CORRIGÉ : résout le vrai nom staging de chaque table de fait (via tableRenames),
+        // au lieu de préfixer "staging_" sur le nom d'affichage courant.
         var unions = sourceColumns.Select(sc =>
-            $"SELECT DISTINCT [{sc.OriginalColumn}] AS DateValue FROM [{schema.StagingDatabase}].[dbo].[{StagingTableName(sc.FactTable)}] WHERE [{sc.OriginalColumn}] IS NOT NULL");
+            $"SELECT DISTINCT [{sc.OriginalColumn}] AS DateValue FROM [{schema.StagingDatabase}].[dbo].[{ResolveStagingTableName(sc.FactTable, schema.TableRenames)}] WHERE [{sc.OriginalColumn}] IS NOT NULL");
 
         var sql = $@"
             INSERT INTO [dbo].[{dim.Name}] ([{pkColumn}], [{dateColumn}])
@@ -162,9 +176,11 @@ public class EtlRunner : IEtlRunner
     // ---------- Sous-dimensions (lues depuis le staging, vraie déduplication) ----------
 
     private static async Task<EtlTableResult> LoadSubDimensionAsync(
-        SqlConnection connection, SqlTransaction transaction, string stagingDb, SubDimension sd)
+        SqlConnection connection, SqlTransaction transaction, string stagingDb, SubDimension sd, List<TableRename>? tableRenames)
     {
-        var stagingTable = StagingTableName(sd.ParentDimension);
+        // ✅ CORRIGÉ : résout le vrai nom staging de la dimension parente, au lieu de préfixer
+        // "staging_" sur son nom d'affichage courant (qui peut avoir été renommé via le chat).
+        var stagingTable = ResolveStagingTableName(sd.ParentDimension, tableRenames);
 
         var sql = $@"
             INSERT INTO [dbo].[{sd.Name}] ([{sd.SourceColumn}])
@@ -181,9 +197,12 @@ public class EtlRunner : IEtlRunner
     private static async Task<EtlTableResult> LoadSimpleDimensionAsync(
     SqlConnection connection, SqlTransaction transaction, string stagingDb, string tableName,
     List<TableAttribute> attributes, List<SubDimension> subDims,
-    List<RealColumnTransformation> columnTransformations) // ✅ NOUVEAU
+    List<RealColumnTransformation> columnTransformations,
+    List<TableRename>? tableRenames) // ✅ NOUVEAU
 {
-    var stagingTable = StagingTableName(tableName);
+    // ✅ CORRIGÉ : résout le vrai nom staging de cette table (via tableRenames), au lieu de
+    // préfixer "staging_" sur le nom d'affichage courant qui peut avoir été renommé via le chat.
+    var stagingTable = ResolveStagingTableName(tableName, tableRenames);
     var subDimSourceColumns = subDims.Select(sd => sd.SourceColumn).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     var transformsByNewName = columnTransformations
@@ -237,10 +256,14 @@ public class EtlRunner : IEtlRunner
     List<TableAttribute> attributes,
     List<FactColumnTransformation> transformations,
     List<FactDimensionLink> factLinks,
-    List<RealColumnTransformation> columnTransformations) // ✅ NOUVEAU
+    List<RealColumnTransformation> columnTransformations,
+    List<TableRename>? tableRenames) // ✅ NOUVEAU
 {
     var warnings = new List<string>();
-    var stagingTable = StagingTableName(factName);
+    // ✅ CORRIGÉ : résout le vrai nom staging de ce fait (via tableRenames), au lieu de
+    // préfixer "staging_" sur le nom d'affichage courant — c'est le bug exact qui causait
+    // "Nom d'objet 'test3.dbo.staging_sales' non valide." après renommage FactSales -> sales.
+    var stagingTable = ResolveStagingTableName(factName, tableRenames);
 
     var excludedColumns = transformations.Select(t => t.OriginalColumn)
         .Concat(factLinks.Select(l => l.NaturalKeyColumn))
