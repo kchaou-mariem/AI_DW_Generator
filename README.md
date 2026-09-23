@@ -7,7 +7,6 @@
 <p align="center">
   <a href="#features">Features</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="#demo">Demo</a> ·
   <a href="#quick-start">Quick start</a>
 </p>
 
@@ -23,7 +22,6 @@
 ## Table of contents
 
 - [Features](#features)
-- [Demo](#demo)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Quick start](#quick-start)
@@ -44,18 +42,6 @@
 - Schema validation and persistence.
 - SQL DDL generation, ETL execution, and tabular model deployment.
 - Full pipeline execution in a single operation.
-
-## Demo
-
-Place the demo video exactly here:
-
-```text
-docs/demo/demo.mp4
-```
-
-Once the file is added, it will be available here: [Watch the demo video](docs/demo/demo.mp4).
-
-For a large video, hosting it on YouTube, Vimeo, or Loom is recommended. Replace the link above with the public URL. GitHub does not always render video tags directly in a README, so a file link or hosted-video link is the most reliable option.
 
 ## Architecture
 
@@ -179,10 +165,6 @@ Service URLs used by the frontend are defined in the Angular configuration under
 ```text
 .
 ├── README.md
-├── docs/
-│   └── demo/
-│       ├── README.md
-│       └── demo.mp4              # add the demo video here
 ├── frontend/                     # Angular application
 ├── backend/                      # NestJS API
 └── DwGenerationEngine/           # .NET 9 solution
